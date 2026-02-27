@@ -1,0 +1,27 @@
+{
+  "jobs": [
+    {
+      "name": "taxscan_feed_to_sheet",
+      "enabled": true,
+      "rss_url": "https://www.taxscan.in/feeds.xml",
+      "spreadsheet_id": "197zi-fymx0YaFYXcnzS0HQmanWccOcOH7oMRPy3OK60",
+      "worksheet_index": 0,
+      "insert_at_row": 2,
+      "columns": {
+        "serial": 0,
+        "title": 1,
+        "link": 2,
+        "date": 3
+      },
+      "utm": {
+        "utm_source": "taxscan",
+        "utm_medium": "whatsapp",
+        "utm_campaign": "news"
+      }
+    }
+  ],
+  "google": {
+    "service_account_file": "service_account.json",
+    "service_account_json_env": "GOOGLE_SERVICE_ACCOUNT_JSON"
+  }
+}

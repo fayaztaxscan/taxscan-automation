@@ -7,12 +7,24 @@
       "spreadsheet_id": "197zi-fymx0YaFYXcnzS0HQmanWccOcOH7oMRPy3OK60",
       "worksheet_index": 0,
       "insert_at_row": 2,
+
+      "retention_days": 3,
+
       "columns": {
         "serial": 0,
         "title": 1,
         "link": 2,
         "date": 3
       },
+
+      "linkedin_columns": {
+        "post_to_linkedin": 4,
+        "posted_at": 5,
+        "post_id": 6,
+        "error": 7
+      },
+      "post_to_linkedin_default": "YES",
+
       "utm": {
         "utm_source": "taxscan",
         "utm_medium": "whatsapp",

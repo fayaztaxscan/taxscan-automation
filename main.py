@@ -20,6 +20,21 @@ def load_config():
         return json.load(f)
 
 
+# ---------------- Debug helpers ----------------
+def url_path_only(u: str) -> str:
+    """scheme://host/path (drops query+fragment) to compare slugs regardless of UTM."""
+    try:
+        p = urlparse(u)
+        return f"{p.scheme}://{p.netloc}{p.path}"
+    except Exception:
+        return (u or "").strip()
+
+
+def shorten(s: str, n: int = 110) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
 # ---------------- Utils ----------------
 def safe_int(x, default=0):
     try:
@@ -134,9 +149,12 @@ def load_credentials(google_cfg: dict):
 
     if sa_json:
         info = json.loads(sa_json)
+        # Safe to print: reveals only service account email
+        print(f"🔑 Service account (env:{env_name}): {info.get('client_email')}")
         return Credentials.from_service_account_info(info, scopes=scopes)
 
     sa_file = google_cfg.get("service_account_file", "service_account.json")
+    print(f"🔑 Service account (file:{sa_file}) exists={os.path.exists(sa_file)}")
     return Credentials.from_service_account_file(sa_file, scopes=scopes)
 
 
@@ -144,12 +162,18 @@ def get_worksheet(google_cfg: dict, spreadsheet_id: str, worksheet_index: int):
     creds = load_credentials(google_cfg)
     client = gspread.authorize(creds)
     sh = client.open_by_key(spreadsheet_id)
-    return sh.get_worksheet(int(worksheet_index))
+    ws = sh.get_worksheet(int(worksheet_index))
+    print(f"📄 Spreadsheet: {sh.title} | Worksheet: {ws.title} | index: {worksheet_index}")
+    return ws
 
 
 # ---------------- Feed ----------------
 def fetch_feed(rss_url: str):
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
     try:
         response = requests.get(rss_url, headers=headers, timeout=20)
         if response.status_code == 200:
@@ -172,6 +196,15 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     - Duplicate protection (link + date), tolerant to old rows without UTM
     - Optional pruning of rows older than retention_days (based on Published Date column)
     - Fills LinkedIn prep columns (E-H): Post to LinkedIn = YES, others blank
+
+    Added debug logs:
+    - Config file used
+    - Service account email (no secrets)
+    - Spreadsheet title + worksheet title
+    - Sheet row counts (before/after prune)
+    - Feed top items (title/link/date)
+    - Skip reasons for duplicates (raw vs utm)
+    - Path-match warnings (same slug but date mismatch)
     """
     rss_url = cfg["rss_url"]
     spreadsheet_id = cfg["spreadsheet_id"]
@@ -206,6 +239,12 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     try:
         sheet = get_worksheet(google_cfg, spreadsheet_id, worksheet_index)
         all_rows = sheet.get_all_values()  # includes header
+        print(f"📏 Sheet rows fetched (incl header): {len(all_rows)}")
+        if len(all_rows) >= 2:
+            top_serial = all_rows[1][col_serial] if len(all_rows[1]) > col_serial else ""
+            top_link = all_rows[1][col_link] if len(all_rows[1]) > col_link else ""
+            top_date = all_rows[1][col_date] if len(all_rows[1]) > col_date else ""
+            print(f"🔎 Current top row: serial={top_serial} | date={top_date} | link={shorten(top_link, 140)}")
     except SpreadsheetNotFound:
         print("❌ Spreadsheet not found. Check spreadsheet_id and sharing permissions.")
         return
@@ -227,13 +266,15 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
             if deleted:
                 print(f"🧹 Pruned {deleted} rows older than {retention_days} days.")
                 all_rows = sheet.get_all_values()  # refresh after deletes
+                print(f"📏 Sheet rows after prune refresh (incl header): {len(all_rows)}")
         except APIError as e:
             print("❌ Google Sheets API Error (prune):")
             print(getattr(e.response, "text", str(e)))
             return
 
-    # 2) Build existing record set + max serial
-    existing_records = set()
+    # 2) Build existing record set + max serial (+ path-only index for debugging)
+    existing_records = set()  # (link, date)
+    existing_paths = set()    # path-only (drops utm/query)
     max_serial = 0
 
     for i, row in enumerate(all_rows):
@@ -249,10 +290,13 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
             sheet_link = str(row[col_link]).strip()
             sheet_date = str(row[col_date]).strip()
 
+            if sheet_link:
+                existing_paths.add(url_path_only(sheet_link))
+
             existing_records.add((sheet_link, sheet_date))
             existing_records.add((add_utm(sheet_link, utm), sheet_date))
 
-    print(f"📊 Connected. Existing keys: {len(existing_records)} | Max Serial: {max_serial}")
+    print(f"📊 Connected. Existing keys: {len(existing_records)} | Existing paths: {len(existing_paths)} | Max Serial: {max_serial}")
 
     # 3) Fetch feed
     entries = fetch_feed(rss_url)
@@ -260,8 +304,22 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         print("⚠️ No entries found in the feed.")
         return
 
+    # Debug: show top 5 feed entries
+    print(f"📰 Feed entries fetched: {len(entries)}")
+    for i, e in enumerate(entries[:5]):
+        t = (e.get("title") or "").strip()
+        l = (e.get("link") or "").strip()
+        dt = (e.get("published") or e.get("updated") or "").strip()
+        print(f"🆕 Feed[{i}] date={dt} | path={url_path_only(l)} | title={shorten(t, 70)}")
+        print(f"    link={shorten(l, 160)}")
+
     # 4) Collect new items with timestamp so we can sort newest-first
     new_items = []  # (ts, title, raw_link, utm_link, date)
+
+    # Keep skip logs short (only first few skips)
+    skip_logged = 0
+    path_mismatch_logged = 0
+
     for entry in entries:
         title = (entry.get("title") or "").strip()
         raw_link = (entry.get("link") or "").strip()
@@ -273,11 +331,38 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         utm_link = add_utm(raw_link, utm)
         ts = entry_ts(entry)
 
+        raw_key = (raw_link, date)
+        utm_key = (utm_link, date)
+
+        raw_exists = raw_key in existing_records
+        utm_exists = utm_key in existing_records
+        path_exists = url_path_only(raw_link) in existing_paths or url_path_only(utm_link) in existing_paths
+
+        # If the article path exists but (link,date) does not, likely date formatting mismatch
+        if path_exists and not (raw_exists or utm_exists):
+            if path_mismatch_logged < 3:
+                print(f"⚠️ PATH MATCH but (link,date) not found: {shorten(title, 70)}")
+                print(f"    path={url_path_only(raw_link)}")
+                print(f"    feed_date={date}")
+            path_mismatch_logged += 1
+
         # Duplicate check against both raw and utm form
-        if (raw_link, date) not in existing_records and (utm_link, date) not in existing_records:
-            new_items.append((ts, title, raw_link, utm_link, date))
-            existing_records.add((raw_link, date))
-            existing_records.add((utm_link, date))
+        if raw_exists or utm_exists:
+            if skip_logged < 5:
+                reasons = []
+                if raw_exists:
+                    reasons.append("raw(link,date) exists")
+                if utm_exists:
+                    reasons.append("utm(link,date) exists")
+                print(f"⏭️ SKIP: {shorten(title, 70)} | feed_date={date} | reasons={', '.join(reasons)}")
+                print(f"    raw={shorten(raw_link, 170)}")
+                print(f"    utm={shorten(utm_link, 170)}")
+            skip_logged += 1
+            continue
+
+        new_items.append((ts, title, raw_link, utm_link, date))
+        existing_records.add(raw_key)
+        existing_records.add(utm_key)
 
     if not new_items:
         print("✨ No new entries to add.")
@@ -286,6 +371,13 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     # 5) Sort newest -> oldest so newest appears at top (row 2)
     new_items_sorted = sorted(new_items, key=lambda x: x[0], reverse=True)
     n = len(new_items_sorted)
+
+    # Debug: show what we plan to insert (top few)
+    print(f"🧩 New items to insert: {n}")
+    for i, (_ts, title, raw_link, utm_link, date) in enumerate(new_items_sorted[:5]):
+        print(f"➕ New[{i}] date={date} | path={url_path_only(raw_link)} | title={shorten(title, 70)}")
+        print(f"    raw={shorten(raw_link, 160)}")
+        print(f"    utm={shorten(utm_link, 160)}")
 
     # Serial highest at top
     serial = max_serial + n
@@ -347,6 +439,8 @@ def run_jobs(config: dict):
 
 def main():
     print("🚀 Starting Taxscan Automation Runner...")
+    print(f"🧾 Using CONFIG_FILE: {CONFIG_FILE} | exists={os.path.exists(CONFIG_FILE)}")
+
     try:
         config = load_config()
     except Exception as e:

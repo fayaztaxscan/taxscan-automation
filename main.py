@@ -169,13 +169,24 @@ def get_worksheet(google_cfg: dict, spreadsheet_id: str, worksheet_index: int):
 
 # ---------------- Feed ----------------
 def fetch_feed(rss_url: str):
+    """
+    Fetch RSS with a cache-buster query param to reduce CDN caching issues.
+    """
+    # Cache buster: unique per run (seconds since epoch)
+    cb = int(datetime.now(timezone.utc).timestamp())
+    sep = "&" if "?" in rss_url else "?"
+    url = f"{rss_url}{sep}cb={cb}"
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
+
+    print(f"🌐 Fetching feed: {url}")
+
     try:
-        response = requests.get(rss_url, headers=headers, timeout=20)
+        response = requests.get(url, headers=headers, timeout=20)
         if response.status_code == 200:
             return feedparser.parse(response.content).entries
         print(f"❌ Feed returned status: {response.status_code}")
@@ -197,7 +208,7 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     - Optional pruning of rows older than retention_days (based on Published Date column)
     - Fills LinkedIn prep columns (E-H): Post to LinkedIn = YES, others blank
 
-    Added debug logs:
+    Debug logs:
     - Config file used
     - Service account email (no secrets)
     - Spreadsheet title + worksheet title
@@ -298,7 +309,7 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
 
     print(f"📊 Connected. Existing keys: {len(existing_records)} | Existing paths: {len(existing_paths)} | Max Serial: {max_serial}")
 
-    # 3) Fetch feed
+    # 3) Fetch feed (with cache buster)
     entries = fetch_feed(rss_url)
     if not entries:
         print("⚠️ No entries found in the feed.")

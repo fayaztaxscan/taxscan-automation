@@ -4,12 +4,17 @@ import requests
 import feedparser
 import gspread
 import calendar
+import re
 
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError, SpreadsheetNotFound
+
+from requests_oauthlib import OAuth1
+from bs4 import BeautifulSoup
+import yake
 
 # ---------------- Config ----------------
 CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.json")
@@ -68,17 +73,13 @@ def entry_ts(entry) -> int:
 
 
 def parse_sheet_date_to_utc(date_str: str):
-    """
-    Parse date in sheet (usually RSS published string) to UTC datetime.
-    Returns None if can't parse.
-    """
+    """Parse RSS/ISO date string from sheet to UTC datetime; returns None if can't parse."""
     if not date_str:
         return None
     s = str(date_str).strip()
     if not s or s.upper() == "N/A":
         return None
 
-    # RSS dates are typically RFC822; parsedate_to_datetime handles that
     try:
         dt = parsedate_to_datetime(s)
         if dt.tzinfo is None:
@@ -87,7 +88,6 @@ def parse_sheet_date_to_utc(date_str: str):
     except Exception:
         pass
 
-    # Fallback: ISO-like
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
@@ -99,16 +99,15 @@ def parse_sheet_date_to_utc(date_str: str):
 
 def prune_rows_older_than(sheet, all_rows, col_date: int, retention_days: int, header_rows: int = 1) -> int:
     """
-    Deletes rows with parsed date older than now - retention_days.
-    Deletes in contiguous batches from bottom to top to keep indices valid.
-    Returns number of rows deleted.
+    Deletes rows older than now-retention_days based on date column.
+    Deletes in contiguous batches from bottom to top.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
 
     to_delete = []
     for idx, row in enumerate(all_rows):
         if idx < header_rows:
-            continue  # keep header
+            continue
         if len(row) <= col_date:
             continue
         dt = parse_sheet_date_to_utc(row[col_date])
@@ -120,7 +119,6 @@ def prune_rows_older_than(sheet, all_rows, col_date: int, retention_days: int, h
 
     to_delete.sort()
 
-    # group contiguous row numbers into ranges
     ranges = []
     start = prev = to_delete[0]
     for r in to_delete[1:]:
@@ -131,7 +129,6 @@ def prune_rows_older_than(sheet, all_rows, col_date: int, retention_days: int, h
             start = prev = r
     ranges.append((start, prev))
 
-    # delete from bottom to top
     deleted = 0
     for (s, e) in reversed(ranges):
         sheet.delete_rows(s, e)
@@ -149,7 +146,6 @@ def load_credentials(google_cfg: dict):
 
     if sa_json:
         info = json.loads(sa_json)
-        # Safe to print: reveals only service account email
         print(f"🔑 Service account (env:{env_name}): {info.get('client_email')}")
         return Credentials.from_service_account_info(info, scopes=scopes)
 
@@ -169,10 +165,7 @@ def get_worksheet(google_cfg: dict, spreadsheet_id: str, worksheet_index: int):
 
 # ---------------- Feed ----------------
 def fetch_feed(rss_url: str):
-    """
-    Fetch RSS with a cache-buster query param to reduce CDN caching issues.
-    """
-    # Cache buster: unique per run (seconds since epoch)
+    """Fetch RSS with a cache-buster query param to reduce CDN caching issues."""
     cb = int(datetime.now(timezone.utc).timestamp())
     sep = "&" if "?" in rss_url else "?"
     url = f"{rss_url}{sep}cb={cb}"
@@ -196,26 +189,517 @@ def fetch_feed(rss_url: str):
         return []
 
 
+# ---------------- X (Twitter) helpers ----------------
+def load_x_oauth1(config: dict) -> OAuth1:
+    xcfg = config.get("x", {})
+    k_env = xcfg.get("api_key_env", "X_API_KEY")
+    s_env = xcfg.get("api_secret_env", "X_API_SECRET")
+    t_env = xcfg.get("access_token_env", "X_ACCESS_TOKEN")
+    ts_env = xcfg.get("access_token_secret_env", "X_ACCESS_TOKEN_SECRET")
+
+    api_key = os.environ.get(k_env, "").strip()
+    api_secret = os.environ.get(s_env, "").strip()
+    access_token = os.environ.get(t_env, "").strip()
+    access_token_secret = os.environ.get(ts_env, "").strip()
+
+    missing = [name for name, val in [
+        (k_env, api_key), (s_env, api_secret), (t_env, access_token), (ts_env, access_token_secret)
+    ] if not val]
+    if missing:
+        raise RuntimeError(f"Missing X env vars: {', '.join(missing)}")
+
+    return OAuth1(api_key, api_secret, access_token, access_token_secret)
+
+
+def post_tweet(oauth: OAuth1, text: str) -> str:
+    url = "https://api.twitter.com/2/tweets"
+    r = requests.post(url, auth=oauth, json={"text": text}, timeout=30)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"X API error {r.status_code}: {r.text}")
+    data = r.json()
+    tweet_id = (data.get("data") or {}).get("id") or ""
+    return tweet_id
+
+
+def build_tweet_text(title: str, url: str, hashtags: str) -> str:
+    """
+    Required format:
+      Title
+      hashtags
+      URL (with UTM)
+
+    Important: X treats URLs as a fixed t.co length (roughly 23 chars),
+    so we budget using TCO_LEN instead of the raw URL string length.
+    """
+    TCO_LEN = 23
+
+    title = (title or "").strip()
+    url = (url or "").strip()
+    hashtags = (hashtags or "").strip()
+
+    # Always use required layout
+    parts = [title, hashtags, url]
+    text = "\n\n".join([p for p in parts if p])
+
+    # Budget using effective length
+    # separators: between 3 parts -> 2 * len("\n\n") = 4
+    effective_len = len(title) + len(hashtags) + (TCO_LEN if url else 0)
+    if title and hashtags: effective_len += 2  # one "\n\n"
+    if (title or hashtags) and url: effective_len += 2  # another "\n\n"
+
+    if effective_len <= 280:
+        return text
+
+    # 1) Trim title first, keep hashtags+url
+    # Recompute how much room title can take
+    fixed = (len(hashtags) + (TCO_LEN if url else 0))
+    fixed += (2 if hashtags and title else 0) + (2 if url and (title or hashtags) else 0)
+
+    max_title = max(30, 280 - fixed)
+    if len(title) > max_title:
+        title = shorten(title, max_title)
+
+    # Rebuild after title trim
+    parts = [title, hashtags, url]
+    text = "\n\n".join([p for p in parts if p])
+
+    # Recompute effective length after title trim
+    effective_len = len(title) + len(hashtags) + (TCO_LEN if url else 0)
+    if title and hashtags: effective_len += 2
+    if (title or hashtags) and url: effective_len += 2
+
+    if effective_len <= 280:
+        return text
+
+    # 2) Still too long? Reduce hashtags (keep #taxscan if present)
+    # We'll drop tags from the front but keep the last tag (usually #taxscan).
+    tags = hashtags.split()
+    if len(tags) > 1:
+        keep_last = tags[-1]
+        tags = tags[:-1]  # drop from this list first
+
+        # Keep removing until it fits
+        while tags:
+            candidate = " ".join(tags + [keep_last])
+            parts = [title, candidate, url]
+            candidate_text = "\n\n".join([p for p in parts if p])
+
+            eff = len(title) + len(candidate) + (TCO_LEN if url else 0)
+            if title and candidate: eff += 2
+            if (title or candidate) and url: eff += 2
+
+            if eff <= 280:
+                return candidate_text
+
+            tags.pop(0)  # drop one more from the start
+
+        # If nothing left except last
+        hashtags = keep_last
+    else:
+        # Already only one tag, keep it
+        hashtags = hashtags
+
+    parts = [title, hashtags, url]
+    text = "\n\n".join([p for p in parts if p])
+    return text
+
+
+# ---------------- Deep hashtag generation (Option A - non-AI) ----------------
+def fetch_article_html_and_text(url: str) -> tuple[str, str]:
+    """
+    Fetch article HTML and return (html, cleaned_text).
+    Cleans Taxscan promo/footer blocks so keyword extraction stays relevant.
+    """
+    base_url = url_path_only(url)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        "Accept": "text/html,application/xhtml+xml",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    r = requests.get(base_url, headers=headers, timeout=25)
+    r.raise_for_status()
+
+    html = r.text
+    soup = BeautifulSoup(html, "lxml")
+
+    # Remove obvious junk tags
+    for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
+        tag.decompose()
+
+    # Prefer article container
+    node = (
+        soup.select_one("article")
+        or soup.select_one("div.entry-content")
+        or soup.select_one("div.td-post-content")
+        or soup.select_one("div.post-content")
+        or soup.select_one("main")
+        or soup
+    )
+
+    text = node.get_text("\n", strip=True)
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+
+    # Drop known promo/footer sections (Taxscan pages include these)
+    cut_markers = [
+        "Support our journalism",
+        "Next Story",
+        "Related Stories",
+        "Quick Links",
+        "Know More",
+        "Get news delivered",
+        "©",
+        "Powered by",
+        "Read the full article.",  # page shows a snippet + this line
+        "* * *",
+    ]
+
+    # If the page includes snippet + "Read the full article." + full text,
+    # keep everything AFTER the separator if present.
+    if "Read the full article." in text and "* * *" in text:
+        # keep after the separator
+        parts = text.split("* * *", 1)
+        if len(parts) == 2:
+            text = parts[1].strip()
+
+    # Cut off at first footer marker
+    for m in cut_markers:
+        idx = text.find(m)
+        if idx != -1 and idx > 200:  # avoid cutting too early
+            text = text[:idx].strip()
+            break
+
+    # Remove inline promo lines anywhere in the remaining text
+    bad_line_starts = (
+        "Read More:",
+        "Also read:",
+        "Also Read:",
+        "Follow us on",
+        "Subscribe",
+        "Telegram",
+        "WhatsApp",
+    )
+    lines = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith(bad_line_starts):
+            continue
+        lines.append(s)
+
+    text = " ".join(lines)
+    text = re.sub(r"\s+", " ", text).strip()
+    
+
+    # Limit to first chunk (core topic usually early)
+    text = remove_author_lines(text)
+    return html, text[:8000]
+
+def extract_taxscan_tags(html: str) -> list[str]:
+    """
+    Try to extract Taxscan's own topic tags from HTML while avoiding nav/footer/author links.
+    Returns a small list of tag-like strings (not normalized to hashtags yet).
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # 1) Try to narrow to likely tag containers first (common WP patterns)
+    # If none found, fall back to whole document.
+    containers = []
+    for sel in [
+        ".tags", ".tagcloud", ".td-post-small-box", ".td-post-source-tags",
+        ".post-tags", ".entry-tags", ".td-tags", ".jp-relatedposts",
+        "[class*='tag']", "[id*='tag']"
+    ]:
+        containers.extend(soup.select(sel))
+    search_scope = containers if containers else [soup]
+
+    candidates: list[str] = []
+
+    for scope in search_scope:
+        for a in scope.find_all("a"):
+            txt = (a.get_text(" ", strip=True) or "").strip()
+            if not txt:
+                continue
+
+            # Reject author bylines and common CTA fragments early
+            if re.match(r"(?i)^\s*by\b", txt):
+                continue
+
+            # Heuristic: tags are short-ish (1–5 words), not sentences
+            if not (2 <= len(txt) <= 35 and len(txt.split()) <= 5):
+                continue
+
+            # Must contain at least one letter
+            if not re.search(r"[A-Za-z]", txt):
+                continue
+
+            candidates.append(txt)
+
+    # 2) Filter out obvious non-tags / site chrome
+    blacklist = {
+        "Home", "Top Stories", "News Updates", "Columns", "Login", "Subscribe",
+        "Next Story", "Related Stories", "Privacy Policy", "Terms and Conditions",
+        "Contact Us", "About Us", "Careers", "Advertise", "Telegram", "Taxscan premium",
+        "Facebook", "Instagram", "YouTube", "WhatsApp", "LinkedIn", "X", "Twitter",
+        "Read More", "Read More:", "Read Order", "Read Full Article", "Read the full article",
+        "Support our journalism", "Donate", "Join", "Follow", "Share"
+    }
+
+    # Generic junk words to reject if they dominate the phrase
+    junk_phrases = {
+        "read more", "read order", "read full article", "support our journalism",
+        "terms", "privacy", "contact", "about", "careers", "advertise"
+    }
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for t in candidates:
+        # Normalize whitespace
+        t = re.sub(r"\s+", " ", t).strip()
+        if not t:
+            continue
+
+        if t in blacklist:
+            continue
+
+        low = t.lower()
+        if low in seen:
+            continue
+
+        # Avoid generic junk phrases
+        if low in junk_phrases:
+            continue
+
+        # Avoid likely person names (authors) like "Kavi Priya"
+        if re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}$", t):
+            continue
+
+        # Avoid very generic single words that show up all over
+        if low in {"taxscan", "order", "court", "case", "tribunal"}:
+            continue
+
+        seen.add(low)
+        out.append(t)
+
+    # 3) Taxscan tags often appear near the end; keep the last few unique ones
+    return out[-10:]
+
+def normalize_tag(s: str) -> str:
+    """Convert keyword phrase to a hashtag token."""
+    s = re.sub(r"[^A-Za-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return ""
+
+    acronyms = {"GST", "ITAT", "CESTAT", "NCLT", "NCLAT", "HC", "SC", "CBDT", "CBIC", "VAT", "TDS", "TCS", "FEMA"}
+    parts = s.split()
+    out = []
+    for p in parts:
+        up = p.upper()
+        if up in acronyms:
+            out.append(up)
+        else:
+            out.append(p.capitalize())
+    tag = "".join(out)
+
+    # keep hashtags reasonably sized
+    return tag[:40]
+
+
+def extract_hashtags_from_text(text: str, max_tags: int = 6) -> list[str]:
+    """Keyword extraction using YAKE (non-AI) with stronger noise filtering (ads/bylines/names)."""
+    if not text:
+        return []
+
+    kw_extractor = yake.KeywordExtractor(
+        lan="en",
+        n=3,
+        top=40,
+        dedupLim=0.9,
+        windowsSize=2
+    )
+    keywords = kw_extractor.extract_keywords(text)  # [(kw, score), ...]
+
+    tags: list[str] = []
+    seen: set[str] = set()
+
+    # Generic noise + promo/social + common boilerplate
+    stop = {
+        "order", "case", "court", "tribunal", "tax", "act", "section", "rule", "rules",
+        "judgment", "appeal", "petition", "authority", "officer", "department",
+        "read more", "also read", "read full article", "support our journalism",
+        "subscribe", "follow", "join", "share", "click", "download",
+        "telegram", "whatsapp", "youtube", "facebook", "instagram",
+        "advertisement", "sponsored", "promo", "offer",
+        "by"  # byline noise
+    }
+
+    # Patterns to reject author/byline-like phrases
+    byline_prefix = re.compile(r"(?i)^\s*by\s*[-:–—]?\s+")
+    # e.g., "Kavi Priya", "John Doe", "Amit Kumar Sharma" (1-3 title-cased words)
+    person_name_like = re.compile(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}$")
+
+    for kw, _score in keywords:
+        raw_kw = (kw or "").strip()
+        if not raw_kw:
+            continue
+
+        # Reject obvious bylines
+        if byline_prefix.match(raw_kw):
+            continue
+
+        # Reject likely author/person names
+        if person_name_like.match(raw_kw):
+            continue
+
+        # Reject keywords that contain common promo strings
+        low_raw = raw_kw.lower()
+        if any(x in low_raw for x in ["support our journalism", "read more", "also read", "subscribe", "follow us"]):
+            continue
+
+        tag = normalize_tag(raw_kw)
+        if not tag:
+            continue
+
+        low = tag.lower()
+
+        # Reject stopwords (after normalization too)
+        if low in stop:
+            continue
+
+        # Reject very short / very long tags (often noise)
+        if len(tag) < 3:
+            continue
+
+        if low in seen:
+            continue
+
+        seen.add(low)
+        tags.append(tag)
+
+        if len(tags) >= max_tags:
+            break
+
+    return tags
+
+def remove_author_lines(text: str) -> str:
+    """
+    Removes author bylines like:
+      'By - Kavi Priya'
+      'By: Kavi Priya'
+      'By Kavi Priya'
+    """
+    if not text:
+        return text
+
+    # Normalize whitespace/newlines for pattern matching
+    t = text.replace("\r", "\n")
+
+    # Remove standalone byline lines
+    t = re.sub(r"(?im)^\s*by\s*[-:–—]?\s*[A-Za-z][A-Za-z .'-]{1,80}\s*$", "", t)
+
+    # Remove inline "By - Name" segments if they appear early
+    t = re.sub(r"(?i)\bby\s*[-:–—]?\s*[A-Za-z][A-Za-z .'-]{1,80}", "", t)
+
+    # Cleanup excess whitespace
+    t = re.sub(r"\n{2,}", "\n", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
+
+
+def build_hashtags_fallback(base: list[str], title: str, max_total: int) -> str:
+    """Simple fallback: base tags + title boosts + always #taxscan at end."""
+    base = [h.strip().lstrip("#") for h in (base or []) if str(h).strip()]
+
+    t = (title or "").lower()
+    boosts = []
+    if "itat" in t: boosts.append("ITAT")
+    if "cestat" in t: boosts.append("CESTAT")
+    if "nclat" in t: boosts.append("NCLAT")
+    if "nclt" in t: boosts.append("NCLT")
+    if "gst" in t: boosts.append("GST")
+    if "income tax" in t: boosts.append("IncomeTax")
+    if "service tax" in t: boosts.append("ServiceTax")
+    if "high court" in t or " hc " in f" {t} ": boosts.append("HighCourt")
+    if "supreme court" in t or " sc " in f" {t} ": boosts.append("SupremeCourt")
+
+    tags = []
+    seen = set()
+    for x in base + boosts:
+        x = x.strip().lstrip("#")
+        if not x:
+            continue
+        lx = x.lower()
+        if lx not in seen:
+            tags.append(x)
+            seen.add(lx)
+        if len(tags) >= max_total:
+            break
+
+    if "taxscan" not in seen:
+        tags.append("taxscan")
+
+    return " ".join([f"#{t}" for t in tags if t])
+
+
+def build_deep_hashtags(title: str, url: str, max_tags: int = 6, always_last: str = "taxscan") -> str:
+    html, text = fetch_article_html_and_text(url)
+
+    # 1) Prefer Taxscan’s own topic tags if we can detect them
+    tags = extract_taxscan_tags(html)
+
+    # If tags look empty/noisy, fallback to YAKE on cleaned article text
+    if not tags or len(" ".join(tags)) < 12:
+        tags = extract_hashtags_from_text(text, max_tags=max_tags)
+
+    # Light title boosts (optional)
+    t = (title or "").lower()
+    boosts = []
+    if "itat" in t: boosts.append("ITAT")
+    if "cestat" in t: boosts.append("CESTAT")
+    if "nclat" in t: boosts.append("NCLAT")
+    if "nclt" in t: boosts.append("NCLT")
+    if "gst" in t: boosts.append("GST")
+    if "high court" in t: boosts.append("HighCourt")
+    if "supreme court" in t: boosts.append("SupremeCourt")
+
+    merged = []
+    seen = set()
+    for x in boosts + tags:
+        x = x.strip().lstrip("#")
+        if not x:
+            continue
+        # normalize to hashtag token
+        x = normalize_tag(x)
+        if not x:
+            continue
+        lx = x.lower()
+        if lx not in seen:
+            merged.append(x)
+            seen.add(lx)
+        if len(merged) >= max_tags:
+            break
+
+    # Ensure #taxscan at end
+    if always_last:
+        al = always_last.strip().lstrip("#")
+        merged = [m for m in merged if m.lower() != al.lower()]
+        merged.append(al)
+
+    print("🧠 Clean text sample:", text[:250])
+    print("🏷️ Tags picked:", tags[:10])
+
+    return " ".join([f"#{t}" for t in merged if t])
+
+
 # ---------------- Jobs ----------------
 def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     """
-    Job: Fetch RSS, write to Google Sheet:
-    - Inserts new rows at top (row 2 by default)
-    - Newest item appears at the very top (row 2)
-    - Serial number is highest at top (descending)
-    - URL includes UTM params
-    - Duplicate protection (link + date), tolerant to old rows without UTM
-    - Optional pruning of rows older than retention_days (based on Published Date column)
-    - Fills LinkedIn prep columns (E-H): Post to LinkedIn = YES, others blank
-
-    Debug logs:
-    - Config file used
-    - Service account email (no secrets)
-    - Spreadsheet title + worksheet title
-    - Sheet row counts (before/after prune)
-    - Feed top items (title/link/date)
-    - Skip reasons for duplicates (raw vs utm)
-    - Path-match warnings (same slug but date mismatch)
+    RSS -> Sheet
+    Inserts new rows at top, prunes older rows, fills LinkedIn and X prep columns.
     """
     rss_url = cfg["rss_url"]
     spreadsheet_id = cfg["spreadsheet_id"]
@@ -223,7 +707,7 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     insert_at_row = int(cfg.get("insert_at_row", 2))
     utm = cfg.get("utm", {})
 
-    retention_days = int(cfg.get("retention_days", 0))  # 0 = no pruning
+    retention_days = int(cfg.get("retention_days", 0))
 
     cols = cfg.get("columns", {})
     col_serial = int(cols.get("serial", 0))
@@ -231,14 +715,21 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     col_link = int(cols.get("link", 2))
     col_date = int(cols.get("date", 3))
 
-    # LinkedIn columns (0-based): E=4, F=5, G=6, H=7
+    # LinkedIn columns (E–H)
     li_cols = cfg.get("linkedin_columns", {})
     col_li_post = int(li_cols.get("post_to_linkedin", 4))
     col_li_posted_at = int(li_cols.get("posted_at", 5))
     col_li_post_id = int(li_cols.get("post_id", 6))
     col_li_error = int(li_cols.get("error", 7))
-
     post_to_linkedin_default = str(cfg.get("post_to_linkedin_default", "YES")).strip() or "YES"
+
+    # X columns (I–L) (optional)
+    x_cols = cfg.get("x_columns", {})
+    col_x_post = int(x_cols.get("post_to_x", 8)) if x_cols else None
+    col_x_posted_at = int(x_cols.get("posted_at", 9)) if x_cols else None
+    col_x_tweet_id = int(x_cols.get("tweet_id", 10)) if x_cols else None
+    col_x_error = int(x_cols.get("error", 11)) if x_cols else None
+    post_to_x_default = str(cfg.get("post_to_x_default", "YES")).strip() or "YES"
 
     print(f"\n🧩 Job: {cfg.get('name', 'taxscan_feed_to_sheet')}")
     print(f"   RSS: {rss_url}")
@@ -246,16 +737,11 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     if retention_days > 0:
         print(f"   Retention: keep last {retention_days} days")
 
-    # 1) Connect to sheet
+    # 1) Connect
     try:
         sheet = get_worksheet(google_cfg, spreadsheet_id, worksheet_index)
-        all_rows = sheet.get_all_values()  # includes header
+        all_rows = sheet.get_all_values()
         print(f"📏 Sheet rows fetched (incl header): {len(all_rows)}")
-        if len(all_rows) >= 2:
-            top_serial = all_rows[1][col_serial] if len(all_rows[1]) > col_serial else ""
-            top_link = all_rows[1][col_link] if len(all_rows[1]) > col_link else ""
-            top_date = all_rows[1][col_date] if len(all_rows[1]) > col_date else ""
-            print(f"🔎 Current top row: serial={top_serial} | date={top_date} | link={shorten(top_link, 140)}")
     except SpreadsheetNotFound:
         print("❌ Spreadsheet not found. Check spreadsheet_id and sharing permissions.")
         return
@@ -264,140 +750,72 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         print(getattr(e.response, "text", str(e)))
         return
 
-    # 1b) Prune old rows (optional)
+    # 1b) Prune
     if retention_days > 0:
         try:
-            deleted = prune_rows_older_than(
-                sheet,
-                all_rows,
-                col_date=col_date,
-                retention_days=retention_days,
-                header_rows=1
-            )
+            deleted = prune_rows_older_than(sheet, all_rows, col_date=col_date, retention_days=retention_days, header_rows=1)
             if deleted:
                 print(f"🧹 Pruned {deleted} rows older than {retention_days} days.")
-                all_rows = sheet.get_all_values()  # refresh after deletes
+                all_rows = sheet.get_all_values()
                 print(f"📏 Sheet rows after prune refresh (incl header): {len(all_rows)}")
         except APIError as e:
             print("❌ Google Sheets API Error (prune):")
             print(getattr(e.response, "text", str(e)))
             return
 
-    # 2) Build existing record set + max serial (+ path-only index for debugging)
-    existing_records = set()  # (link, date)
-    existing_paths = set()    # path-only (drops utm/query)
+    # 2) Existing
+    existing_records = set()
     max_serial = 0
-
     for i, row in enumerate(all_rows):
         if i == 0:
             continue
-
-        # max serial
         if len(row) > col_serial and str(row[col_serial]).strip():
             max_serial = max(max_serial, safe_int(row[col_serial], 0))
-
-        # existing (link,date)
         if len(row) > max(col_link, col_date):
             sheet_link = str(row[col_link]).strip()
             sheet_date = str(row[col_date]).strip()
-
-            if sheet_link:
-                existing_paths.add(url_path_only(sheet_link))
-
             existing_records.add((sheet_link, sheet_date))
             existing_records.add((add_utm(sheet_link, utm), sheet_date))
 
-    print(f"📊 Connected. Existing keys: {len(existing_records)} | Existing paths: {len(existing_paths)} | Max Serial: {max_serial}")
+    print(f"📊 Connected. Existing keys: {len(existing_records)} | Max Serial: {max_serial}")
 
-    # 3) Fetch feed (with cache buster)
+    # 3) Fetch feed
     entries = fetch_feed(rss_url)
     if not entries:
         print("⚠️ No entries found in the feed.")
         return
 
-    # Debug: show top 5 feed entries
-    print(f"📰 Feed entries fetched: {len(entries)}")
-    for i, e in enumerate(entries[:5]):
-        t = (e.get("title") or "").strip()
-        l = (e.get("link") or "").strip()
-        dt = (e.get("published") or e.get("updated") or "").strip()
-        print(f"🆕 Feed[{i}] date={dt} | path={url_path_only(l)} | title={shorten(t, 70)}")
-        print(f"    link={shorten(l, 160)}")
-
-    # 4) Collect new items with timestamp so we can sort newest-first
-    new_items = []  # (ts, title, raw_link, utm_link, date)
-
-    # Keep skip logs short (only first few skips)
-    skip_logged = 0
-    path_mismatch_logged = 0
-
+    # 4) Collect new
+    new_items = []
     for entry in entries:
         title = (entry.get("title") or "").strip()
         raw_link = (entry.get("link") or "").strip()
         date = (entry.get("published") or entry.get("updated") or "N/A").strip()
-
         if not raw_link:
             continue
-
         utm_link = add_utm(raw_link, utm)
         ts = entry_ts(entry)
 
-        raw_key = (raw_link, date)
-        utm_key = (utm_link, date)
-
-        raw_exists = raw_key in existing_records
-        utm_exists = utm_key in existing_records
-        path_exists = url_path_only(raw_link) in existing_paths or url_path_only(utm_link) in existing_paths
-
-        # If the article path exists but (link,date) does not, likely date formatting mismatch
-        if path_exists and not (raw_exists or utm_exists):
-            if path_mismatch_logged < 3:
-                print(f"⚠️ PATH MATCH but (link,date) not found: {shorten(title, 70)}")
-                print(f"    path={url_path_only(raw_link)}")
-                print(f"    feed_date={date}")
-            path_mismatch_logged += 1
-
-        # Duplicate check against both raw and utm form
-        if raw_exists or utm_exists:
-            if skip_logged < 5:
-                reasons = []
-                if raw_exists:
-                    reasons.append("raw(link,date) exists")
-                if utm_exists:
-                    reasons.append("utm(link,date) exists")
-                print(f"⏭️ SKIP: {shorten(title, 70)} | feed_date={date} | reasons={', '.join(reasons)}")
-                print(f"    raw={shorten(raw_link, 170)}")
-                print(f"    utm={shorten(utm_link, 170)}")
-            skip_logged += 1
+        if (raw_link, date) in existing_records or (utm_link, date) in existing_records:
             continue
 
         new_items.append((ts, title, raw_link, utm_link, date))
-        existing_records.add(raw_key)
-        existing_records.add(utm_key)
+        existing_records.add((raw_link, date))
+        existing_records.add((utm_link, date))
 
     if not new_items:
         print("✨ No new entries to add.")
         return
 
-    # 5) Sort newest -> oldest so newest appears at top (row 2)
+    # 5) Sort newest -> oldest
     new_items_sorted = sorted(new_items, key=lambda x: x[0], reverse=True)
     n = len(new_items_sorted)
-
-    # Debug: show what we plan to insert (top few)
-    print(f"🧩 New items to insert: {n}")
-    for i, (_ts, title, raw_link, utm_link, date) in enumerate(new_items_sorted[:5]):
-        print(f"➕ New[{i}] date={date} | path={url_path_only(raw_link)} | title={shorten(title, 70)}")
-        print(f"    raw={shorten(raw_link, 160)}")
-        print(f"    utm={shorten(utm_link, 160)}")
-
-    # Serial highest at top
     serial = max_serial + n
 
-    # Ensure inserted row covers up to LinkedIn columns too
-    max_col_needed = max(
-        col_serial, col_title, col_link, col_date,
-        col_li_post, col_li_posted_at, col_li_post_id, col_li_error
-    )
+    # Ensure row length
+    max_col_needed = max(col_serial, col_title, col_link, col_date, col_li_post, col_li_posted_at, col_li_post_id, col_li_error)
+    if col_x_post is not None:
+        max_col_needed = max(max_col_needed, col_x_post, col_x_posted_at, col_x_tweet_id, col_x_error)
 
     rows_to_insert = []
     for (_ts, title, _raw_link, utm_link, date) in new_items_sorted:
@@ -407,11 +825,18 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         row[col_link] = utm_link
         row[col_date] = date
 
-        # LinkedIn prep columns
+        # LinkedIn prep
         row[col_li_post] = post_to_linkedin_default
         row[col_li_posted_at] = ""
         row[col_li_post_id] = ""
         row[col_li_error] = ""
+
+        # X prep (if configured)
+        if col_x_post is not None:
+            row[col_x_post] = post_to_x_default
+            row[col_x_posted_at] = ""
+            row[col_x_tweet_id] = ""
+            row[col_x_error] = ""
 
         rows_to_insert.append(row)
         serial -= 1
@@ -426,6 +851,145 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         print(getattr(e.response, "text", str(e)))
     except Exception as e:
         print(f"❌ Insert rows error: {repr(e)}")
+
+
+def job_sheet_to_x(cfg: dict, config: dict, google_cfg: dict):
+    """
+    Sheet -> X
+    Tweets unposted rows, generates per-article hashtags by fetching article content.
+    """
+    spreadsheet_id = cfg["spreadsheet_id"]
+    worksheet_index = cfg.get("worksheet_index", 0)
+    scan_top_rows = int(cfg.get("scan_top_rows", 200))
+    post_limit = int(cfg.get("post_limit_per_run", 3))
+
+    x_utm = cfg.get("x_utm", {"utm_source": "taxscan", "utm_medium": "x", "utm_campaign": "news"})
+    base_hashtags = cfg.get("hashtags", ["TaxNews", "taxscan"])
+    max_hashtags = int(cfg.get("max_hashtags", 6))
+
+    # Find feed job for column mapping
+    feed_job = None
+    for j in config.get("jobs", []):
+        if j.get("name") == "taxscan_feed_to_sheet":
+            feed_job = j
+            break
+    if not feed_job:
+        print("❌ sheet_to_x: cannot find taxscan_feed_to_sheet job for column mapping.")
+        return
+
+    cols = feed_job.get("columns", {})
+    col_title = int(cols.get("title", 1))
+    col_link = int(cols.get("link", 2))
+    col_date = int(cols.get("date", 3))
+
+    x_cols = feed_job.get("x_columns", {})
+    if not x_cols:
+        print("❌ sheet_to_x: x_columns not found in taxscan_feed_to_sheet config.")
+        return
+
+    col_x_post = int(x_cols.get("post_to_x", 8))
+    col_x_posted_at = int(x_cols.get("posted_at", 9))
+    col_x_tweet_id = int(x_cols.get("tweet_id", 10))
+    col_x_error = int(x_cols.get("error", 11))
+    post_to_x_default = str(feed_job.get("post_to_x_default", "YES")).strip() or "YES"
+
+    print(f"\n🧩 Job: {cfg.get('name', 'sheet_to_x')}")
+    print(f"   Sheet: {spreadsheet_id} (tab index {worksheet_index})")
+    print(f"   Scan top rows: {scan_top_rows} | Post limit: {post_limit}")
+
+    # X auth
+    try:
+        oauth = load_x_oauth1(config)
+    except Exception as e:
+        print(f"❌ X auth error: {e}")
+        return
+
+    # Sheet open
+    try:
+        sheet = get_worksheet(google_cfg, spreadsheet_id, worksheet_index)
+    except Exception as e:
+        print(f"❌ sheet_to_x: sheet open error: {e}")
+        return
+
+    # Read top range (A1:...N)
+    last_col_index = max(col_title, col_link, col_date, col_x_post, col_x_posted_at, col_x_tweet_id, col_x_error) + 1
+
+    def col_to_a1(n: int) -> str:
+        s = ""
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            s = chr(65 + r) + s
+        return s
+
+    last_col_letter = col_to_a1(last_col_index)
+    end_row = 1 + scan_top_rows
+    rng = f"A1:{last_col_letter}{end_row}"
+
+    try:
+        rows = sheet.get(rng)
+    except Exception as e:
+        print(f"❌ sheet_to_x: read range error: {e}")
+        return
+
+    if not rows or len(rows) < 2:
+        print("⚠️ sheet_to_x: no data rows.")
+        return
+
+    now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d %H:%M:%S IST")
+
+    posted = 0
+    for i in range(1, len(rows)):  # skip header
+        if posted >= post_limit:
+            break
+
+        row = rows[i]
+        sheet_row_number = i + 1
+
+        def cell(col_idx: int) -> str:
+            return str(row[col_idx]).strip() if len(row) > col_idx and row[col_idx] is not None else ""
+
+        title = cell(col_title)
+        link = cell(col_link)
+        post_flag = cell(col_x_post).upper() if cell(col_x_post) else post_to_x_default.upper()
+        already_posted_at = cell(col_x_posted_at)
+
+        if post_flag == "NO":
+            continue
+        if already_posted_at:
+            continue
+        if not title or not link:
+            continue
+
+        # X UTM link (ensure medium=x)
+        x_link = add_utm(url_path_only(link), x_utm)
+
+        # Per-article hashtags (deep). Fallback if fetch/parse fails.
+        try:
+            hashtags = build_deep_hashtags(title, link, max_tags=max_hashtags, always_last="taxscan")
+        except Exception as e:
+            hashtags = build_hashtags_fallback(base_hashtags, title, max_hashtags)
+            print(f"⚠️ Hashtag deep-gen failed row {sheet_row_number}: {shorten(str(e), 120)}")
+
+        tweet_text = build_tweet_text(title, x_link, hashtags)
+
+        try:
+            print("✍️ Tweet preview:\n" + tweet_text + "\n" + "-" * 50)
+            print(f"DEBUG row={sheet_row_number} title_len={len(title)} hashtags_len={len(hashtags)} url_len={len(x_link)}")
+            tweet_id = post_tweet(oauth, tweet_text)
+            sheet.update_cell(sheet_row_number, col_x_posted_at + 1, now_ist)
+            sheet.update_cell(sheet_row_number, col_x_tweet_id + 1, tweet_id)
+            sheet.update_cell(sheet_row_number, col_x_error + 1, "")
+            print(f"✅ Tweeted row {sheet_row_number}: id={tweet_id} | {shorten(title, 70)}")
+            posted += 1
+        except Exception as e:
+            err = str(e)
+            try:
+                sheet.update_cell(sheet_row_number, col_x_error + 1, shorten(err, 240))
+            except Exception:
+                pass
+            print(f"❌ Tweet failed row {sheet_row_number}: {shorten(title, 70)} | {shorten(err, 160)}")
+
+    print(f"✨ sheet_to_x complete. Posted {posted} tweet(s).")
 
 
 def run_jobs(config: dict):
@@ -444,6 +1008,8 @@ def run_jobs(config: dict):
         name = job.get("name")
         if name == "taxscan_feed_to_sheet":
             job_taxscan_feed_to_sheet(job, google_cfg)
+        elif name == "sheet_to_x":
+            job_sheet_to_x(job, config, google_cfg)
         else:
             print(f"⚠️ Unknown job name '{name}'. (Add handler in main.py)")
 

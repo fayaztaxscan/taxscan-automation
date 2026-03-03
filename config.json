@@ -25,15 +25,50 @@
       },
       "post_to_linkedin_default": "YES",
 
+      "x_columns": {
+        "post_to_x": 8,
+        "posted_at": 9,
+        "tweet_id": 10,
+        "error": 11
+      },
+      "post_to_x_default": "YES",
+
       "utm": {
         "utm_source": "taxscan",
         "utm_medium": "whatsapp",
         "utm_campaign": "news"
       }
+    },
+
+    {
+      "name": "sheet_to_x",
+      "enabled": true,
+      "spreadsheet_id": "197zi-fymx0YaFYXcnzS0HQmanWccOcOH7oMRPy3OK60",
+      "worksheet_index": 0,
+
+      "scan_top_rows": 200,
+      "post_limit_per_run": 1,
+
+      "x_utm": {
+        "utm_source": "taxscan",
+        "utm_medium": "x",
+        "utm_campaign": "news"
+      },
+
+      "hashtags": ["TaxNews", "taxscan"],
+      "max_hashtags": 6
     }
   ],
+
   "google": {
     "service_account_file": "service_account.json",
     "service_account_json_env": "GOOGLE_SERVICE_ACCOUNT_JSON"
+  },
+
+  "x": {
+    "api_key_env": "X_API_KEY",
+    "api_secret_env": "X_API_SECRET",
+    "access_token_env": "X_ACCESS_TOKEN",
+    "access_token_secret_env": "X_ACCESS_TOKEN_SECRET"
   }
 }

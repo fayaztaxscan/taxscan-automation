@@ -1,4 +1,9 @@
-requests
-feedparser
-gspread
-google-auth
+requests==2.32.3
+feedparser==6.0.11
+gspread==6.1.4
+google-auth==2.33.0
+requests-oauthlib==2.0.0
+oauthlib==3.2.2
+beautifulsoup4==4.12.3
+lxml==5.3.0
+yake==0.4.8

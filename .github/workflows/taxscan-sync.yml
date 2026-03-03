@@ -26,5 +26,14 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           CONFIG_FILE: config.json
+
+	  # X (Twitter) OAuth 1.0a secrets
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+
+          # (Optional) LinkedIn placeholder secrets (not used until you enable LinkedIn job)
+          LINKEDIN_ORG_URN: ${{ secrets.LINKEDIN_ORG_URN }}
         run: |
           python main.py

@@ -22,6 +22,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ✅ Skip running between 12:00 AM and 5:00 AM IST
+      # IST = Asia/Kolkata (UTC+5:30). This guard avoids cron timezone/30-min offset issues.
+      - name: Skip midnight window (12–5 AM IST)
+        shell: bash
+        run: |
+          HOUR_IST=$(TZ="Asia/Kolkata" date +%H)
+          if [ "$HOUR_IST" -ge 0 ] && [ "$HOUR_IST" -lt 5 ]; then
+            echo "Within 12–5 AM IST. Skipping run."
+            exit 0
+          fi
+          echo "Outside skip window. Continuing."
+
       - name: Run automation
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}

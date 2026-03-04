@@ -47,7 +47,7 @@
       "worksheet_index": 0,
 
       "scan_top_rows": 200,
-      "post_limit_per_run": 1,
+      "post_limit_per_run": 2,
 
       "x_utm": {
         "utm_source": "taxscan",

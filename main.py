@@ -79,6 +79,23 @@ def entry_ts(entry) -> int:
         pass
     return 0
 
+def format_feed_date_to_ist(date_str: str) -> str:
+    """
+    Convert RSS/ISO date string to IST display format.
+    Example output: 11 Mar 2026 01:32 PM IST
+    Falls back to original string if parsing fails.
+    """
+    if not date_str:
+        return date_str
+
+    dt = parse_sheet_date_to_utc(date_str)
+    if not dt:
+        return date_str
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    dt_ist = dt.astimezone(ist)
+    return dt_ist.strftime("%d %b %Y %I:%M %p IST")
+
 
 def parse_sheet_date_to_utc(date_str: str):
     """Parse RSS/ISO date string from sheet to UTC datetime; returns None if can't parse."""
@@ -834,18 +851,19 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     for entry in entries:
         title = (entry.get("title") or "").strip()
         raw_link = (entry.get("link") or "").strip()
-        date = (entry.get("published") or entry.get("updated") or "N/A").strip()
+        raw_date = (entry.get("published") or entry.get("updated") or "N/A").strip()
+        date = format_feed_date_to_ist(raw_date)
         if not raw_link:
             continue
         utm_link = add_utm(raw_link, utm)
         ts = entry_ts(entry)
 
-        if (raw_link, date) in existing_records or (utm_link, date) in existing_records:
+        if (raw_link, raw_date) in existing_records or (utm_link, raw_date) in existing_records:
             continue
 
-        new_items.append((ts, title, raw_link, utm_link, date))
-        existing_records.add((raw_link, date))
-        existing_records.add((utm_link, date))
+        new_items.append((ts, title, raw_link, utm_link, date, raw_date))
+        existing_records.add((raw_link, raw_date))
+        existing_records.add((utm_link, raw_date))
 
     if not new_items:
         print("✨ No new entries to add.")
@@ -862,7 +880,7 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         max_col_needed = max(max_col_needed, col_fb_post, col_fb_posted_at, col_fb_post_id, col_fb_error)
 
     rows_to_insert = []
-    for (_ts, title, _raw_link, utm_link, date) in new_items_sorted:
+    for (_ts, title, _raw_link, utm_link, date, _raw_date) in new_items_sorted:
         row = [""] * (max_col_needed + 1)
         row[col_serial] = serial
         row[col_title] = title
@@ -1125,7 +1143,9 @@ def job_sheet_to_facebook_shopscan(cfg: dict, config: dict, google_cfg: dict):
         fb_link = add_utm(url_path_only(link), fb_utm)
 
         try:
-            hashtags = build_deep_hashtags(title, link, max_tags=max_hashtags, always_last="taxscan")
+            hashtags = build_deep_hashtags(title, link, max_tags=max_hashtags, always_last="shopscan")
+            if "#taxscan" not in hashtags.lower():
+                hashtags = f"{hashtags} #taxscan".strip()
         except Exception as e:
             hashtags = build_hashtags_fallback(base_hashtags, title, max_hashtags)
             print(f"⚠️ Facebook hashtag deep-gen failed row {sheet_row_number}: {shorten(str(e), 120)}")
@@ -1178,7 +1198,7 @@ def run_jobs(config: dict):
                 print(f"⚠️ Unknown job name '{name}'. (Add handler in main.py)")
         except Exception as e:
             print(f"❌ Job failed: {name} | {repr(e)}")
-            
+
 def main():
     print("🚀 Starting Taxscan Automation Runner...")
     print(f"🧾 Using CONFIG_FILE: {CONFIG_FILE} | exists={os.path.exists(CONFIG_FILE)}")

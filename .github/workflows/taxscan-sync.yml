@@ -45,6 +45,10 @@ jobs:
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
 
+          # Facebook Page secrets (Shopscan first)
+          FB_PAGE_ID_SHOPSCAN: ${{ secrets.FB_PAGE_ID_SHOPSCAN }}
+          FB_PAGE_TOKEN_SHOPSCAN: ${{ secrets.FB_PAGE_TOKEN_SHOPSCAN }}
+
           # (Optional) LinkedIn placeholder secrets (not used until you enable LinkedIn job)
           LINKEDIN_ORG_URN: ${{ secrets.LINKEDIN_ORG_URN }}
         run: |

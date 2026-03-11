@@ -33,6 +33,14 @@
       },
       "post_to_x_default": "YES",
 
+      "facebook_shopscan_columns": {
+        "post_to_facebook": 20,
+        "posted_at": 21,
+        "post_id": 22,
+        "error": 23
+      },
+      "post_to_facebook_shopscan_default": "NO",
+
       "utm": {
         "utm_source": "taxscan",
         "utm_medium": "whatsapp",
@@ -57,6 +65,26 @@
 
       "hashtags": ["TaxNews", "taxscan"],
       "max_hashtags": 6
+    },
+
+    {
+      "name": "sheet_to_facebook_shopscan",
+      "enabled": false,
+      "spreadsheet_id": "197zi-fymx0YaFYXcnzS0HQmanWccOcOH7oMRPy3OK60",
+      "worksheet_index": 0,
+
+      "scan_top_rows": 200,
+      "post_limit_per_run": 2,
+
+      "facebook_message_mode": "title_hashtags_link",
+      "hashtags": ["TaxNews", "taxscan"],
+      "max_hashtags": 6,
+
+      "facebook_utm": {
+        "utm_source": "taxscan",
+        "utm_medium": "facebook",
+        "utm_campaign": "news"
+      }
     }
   ],
 
@@ -70,5 +98,10 @@
     "api_secret_env": "X_API_SECRET",
     "access_token_env": "X_ACCESS_TOKEN",
     "access_token_secret_env": "X_ACCESS_TOKEN_SECRET"
+  },
+
+  "facebook": {
+    "shopscan_page_id_env": "FB_PAGE_ID_SHOPSCAN",
+    "shopscan_page_token_env": "FB_PAGE_TOKEN_SHOPSCAN"
   }
 }

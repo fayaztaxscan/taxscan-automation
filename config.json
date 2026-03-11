@@ -39,7 +39,7 @@
         "post_id": 22,
         "error": 23
       },
-      "post_to_facebook_shopscan_default": "NO",
+      "post_to_facebook_shopscan_default": "YES",
 
       "utm": {
         "utm_source": "taxscan",
@@ -69,7 +69,7 @@
 
     {
       "name": "sheet_to_facebook_shopscan",
-      "enabled": false,
+      "enabled": true,
       "spreadsheet_id": "197zi-fymx0YaFYXcnzS0HQmanWccOcOH7oMRPy3OK60",
       "worksheet_index": 0,
 

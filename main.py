@@ -803,6 +803,7 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
             print(getattr(e.response, "text", str(e)))
             return
 
+    # FIXED DEDUPE: use article path only, not (link + date)
     existing_paths = set()
     max_serial = 0
     for i, row in enumerate(all_rows):
@@ -828,6 +829,7 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         raw_link = (entry.get("link") or "").strip()
         raw_date = (entry.get("published") or entry.get("updated") or "N/A").strip()
         date = format_feed_date_to_ist(raw_date)
+
         if not raw_link:
             continue
 
@@ -838,7 +840,7 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         utm_link = add_utm(raw_link, utm)
         ts = entry_ts(entry)
 
-        new_items.append((ts, title, raw_link, utm_link, date, raw_date))
+        new_items.append((ts, title, raw_link, utm_link, date))
         existing_paths.add(raw_path)
 
     if not new_items:
@@ -856,7 +858,7 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         max_col_needed = max(max_col_needed, col_fb_post, col_fb_posted_at, col_fb_post_id, col_fb_error)
 
     rows_to_insert = []
-    for (_ts, title, _raw_link, utm_link, date, _raw_date) in new_items_sorted:
+    for (_ts, title, _raw_link, utm_link, date) in new_items_sorted:
         row = [""] * (max_col_needed + 1)
         row[col_serial] = serial
         row[col_title] = title

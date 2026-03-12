@@ -98,13 +98,15 @@ def format_feed_date_to_ist(date_str: str) -> str:
 
 
 def parse_sheet_date_to_utc(date_str: str):
-    """Parse RSS/ISO date string from sheet to UTC datetime; returns None if can't parse."""
+    """Parse RSS/ISO/custom IST date string from sheet to UTC datetime; returns None if can't parse."""
     if not date_str:
         return None
+
     s = str(date_str).strip()
     if not s or s.upper() == "N/A":
         return None
 
+    # 1) RFC / email-style dates
     try:
         dt = parsedate_to_datetime(s)
         if dt.tzinfo is None:
@@ -113,13 +115,27 @@ def parse_sheet_date_to_utc(date_str: str):
     except Exception:
         pass
 
+    # 2) ISO dates
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
-        return None
+        pass
+
+    # 3) Custom IST display format: 12 Mar 2026 12:50 PM IST
+    try:
+        if s.endswith(" IST"):
+            base = s[:-4].strip()
+            dt = datetime.strptime(base, "%d %b %Y %I:%M %p")
+            ist = timezone(timedelta(hours=5, minutes=30))
+            dt = dt.replace(tzinfo=ist)
+            return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+
+    return None
 
 
 def prune_rows_older_than(sheet, all_rows, col_date: int, retention_days: int, header_rows: int = 1) -> int:

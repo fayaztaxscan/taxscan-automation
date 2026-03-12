@@ -735,6 +735,7 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     RSS -> Sheet
     Inserts new rows at top, prunes older rows, fills LinkedIn, X, and optional Facebook prep columns.
     """
+    
     rss_url = cfg["rss_url"]
     spreadsheet_id = cfg["spreadsheet_id"]
     worksheet_index = cfg.get("worksheet_index", 0)
@@ -745,6 +746,8 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     if retention_hours <= 0:
         retention_days = int(cfg.get("retention_days", 0))
         retention_hours = retention_days * 24
+
+    feed_cutoff_utc = datetime.now(timezone.utc) - timedelta(hours=retention_hours) if retention_hours > 0 else None
 
     cols = cfg.get("columns", {})
     col_serial = int(cols.get("serial", 0))
@@ -831,6 +834,11 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         date = format_feed_date_to_ist(raw_date)
 
         if not raw_link:
+            continue
+
+        # Skip feed entries older than retention window
+        entry_dt_utc = parse_sheet_date_to_utc(raw_date)
+        if feed_cutoff_utc and entry_dt_utc and entry_dt_utc < feed_cutoff_utc:
             continue
 
         raw_path = url_path_only(raw_link)

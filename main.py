@@ -19,6 +19,16 @@ import yake
 # ---------------- Config ----------------
 CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.json")
 
+# ---------------- In-memory caches ----------------
+ARTICLE_FETCH_CACHE = {}
+HASHTAG_CACHE = {}
+
+# Reuse HTTP connection pool
+HTTP = requests.Session()
+HTTP.headers.update({
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+})
+
 
 def load_config():
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -79,9 +89,10 @@ def entry_ts(entry) -> int:
         pass
     return 0
 
+
 def format_feed_date_to_ist(date_str: str) -> str:
     """
-    Convert RSS/ISO date string to IST display format.
+    Convert RSS/ISO/custom date string to IST display format.
     Example output: 11 Mar 2026 01:32 PM IST
     Falls back to original string if parsing fails.
     """
@@ -138,12 +149,13 @@ def parse_sheet_date_to_utc(date_str: str):
     return None
 
 
-def prune_rows_older_than(sheet, all_rows, col_date: int, retention_days: int, header_rows: int = 1) -> int:
+def prune_rows_older_than(sheet, all_rows, col_date: int, retention_hours: int, header_rows: int = 1) -> int:
     """
-    Deletes rows older than now-retention_days based on date column.
+    Deletes rows older than now-retention_hours based on date column.
+    Rolling-hours retention.
     Deletes in contiguous batches from bottom to top.
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
 
     to_delete = []
     for idx, row in enumerate(all_rows):
@@ -151,6 +163,7 @@ def prune_rows_older_than(sheet, all_rows, col_date: int, retention_days: int, h
             continue
         if len(row) <= col_date:
             continue
+
         dt = parse_sheet_date_to_utc(row[col_date])
         if dt and dt < cutoff:
             to_delete.append(idx + 1)  # gspread rows are 1-based
@@ -212,7 +225,6 @@ def fetch_feed(rss_url: str):
     url = f"{rss_url}{sep}cb={cb}"
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
@@ -220,7 +232,7 @@ def fetch_feed(rss_url: str):
     print(f"🌐 Fetching feed: {url}")
 
     try:
-        response = requests.get(url, headers=headers, timeout=20)
+        response = HTTP.get(url, headers=headers, timeout=20)
         if response.status_code == 200:
             return feedparser.parse(response.content).entries
         print(f"❌ Feed returned status: {response.status_code}")
@@ -263,15 +275,6 @@ def post_tweet(oauth: OAuth1, text: str) -> str:
 
 
 def build_tweet_text(title: str, url: str, hashtags: str) -> str:
-    """
-    Required format:
-      Title
-      hashtags
-      URL (with UTM)
-
-    Important: X treats URLs as a fixed t.co length (roughly 23 chars),
-    so we budget using TCO_LEN instead of the raw URL string length.
-    """
     TCO_LEN = 23
 
     title = (title or "").strip()
@@ -331,12 +334,9 @@ def build_tweet_text(title: str, url: str, hashtags: str) -> str:
             tags.pop(0)
 
         hashtags = keep_last
-    else:
-        hashtags = hashtags
 
     parts = [title, hashtags, url]
-    text = "\n\n".join([p for p in parts if p])
-    return text
+    return "\n\n".join([p for p in parts if p])
 
 
 # ---------------- Facebook helpers ----------------
@@ -385,7 +385,7 @@ def post_to_facebook_page(page_id: str, page_token: str, message: str, link: str
     if (link or "").strip():
         payload["link"] = link.strip()
 
-    r = requests.post(endpoint, data=payload, timeout=30)
+    r = HTTP.post(endpoint, data=payload, timeout=30)
 
     try:
         data = r.json()
@@ -406,17 +406,19 @@ def post_to_facebook_page(page_id: str, page_token: str, message: str, link: str
 def fetch_article_html_and_text(url: str) -> tuple[str, str]:
     """
     Fetch article HTML and return (html, cleaned_text).
-    Cleans Taxscan promo/footer blocks so keyword extraction stays relevant.
+    Uses in-memory cache per article path.
     """
     base_url = url_path_only(url)
 
+    if base_url in ARTICLE_FETCH_CACHE:
+        return ARTICLE_FETCH_CACHE[base_url]
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
         "Accept": "text/html,application/xhtml+xml",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
-    r = requests.get(base_url, headers=headers, timeout=25)
+    r = HTTP.get(base_url, headers=headers, timeout=25)
     r.raise_for_status()
 
     html = r.text
@@ -483,14 +485,12 @@ def fetch_article_html_and_text(url: str) -> tuple[str, str]:
     text = re.sub(r"\s+", " ", text).strip()
 
     text = remove_author_lines(text)
-    return html, text[:8000]
+    result = (html, text[:8000])
+    ARTICLE_FETCH_CACHE[base_url] = result
+    return result
 
 
 def extract_taxscan_tags(html: str) -> list[str]:
-    """
-    Try to extract Taxscan's own topic tags from HTML while avoiding nav/footer/author links.
-    Returns a small list of tag-like strings (not normalized to hashtags yet).
-    """
     soup = BeautifulSoup(html, "lxml")
 
     containers = []
@@ -509,16 +509,12 @@ def extract_taxscan_tags(html: str) -> list[str]:
             txt = (a.get_text(" ", strip=True) or "").strip()
             if not txt:
                 continue
-
             if re.match(r"(?i)^\s*by\b", txt):
                 continue
-
             if not (2 <= len(txt) <= 35 and len(txt.split()) <= 5):
                 continue
-
             if not re.search(r"[A-Za-z]", txt):
                 continue
-
             candidates.append(txt)
 
     blacklist = {
@@ -527,12 +523,12 @@ def extract_taxscan_tags(html: str) -> list[str]:
         "Contact Us", "About Us", "Careers", "Advertise", "Telegram", "Taxscan premium",
         "Facebook", "Instagram", "YouTube", "WhatsApp", "LinkedIn", "X", "Twitter",
         "Read More", "Read More:", "Read Order", "Read Full Article", "Read the full article",
-        "Support our journalism", "Donate", "Join", "Follow", "Share"
+        "Support our journalism", "Donate", "Join", "Follow", "Share", "More"
     }
 
     junk_phrases = {
         "read more", "read order", "read full article", "support our journalism",
-        "terms", "privacy", "contact", "about", "careers", "advertise"
+        "terms", "privacy", "contact", "about", "careers", "advertise", "more"
     }
 
     out: list[str] = []
@@ -543,20 +539,14 @@ def extract_taxscan_tags(html: str) -> list[str]:
         if not t:
             continue
 
-        if t in blacklist:
-            continue
-
         low = t.lower()
-        if low in seen:
-            continue
-
-        if low in junk_phrases:
+        if t in blacklist or low in junk_phrases or low in seen:
             continue
 
         if re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}$", t):
             continue
 
-        if low in {"taxscan", "order", "court", "case", "tribunal"}:
+        if low in {"taxscan", "order", "court", "case", "tribunal", "more"}:
             continue
 
         seen.add(low)
@@ -566,13 +556,12 @@ def extract_taxscan_tags(html: str) -> list[str]:
 
 
 def normalize_tag(s: str) -> str:
-    """Convert keyword phrase to a hashtag token."""
     s = re.sub(r"[^A-Za-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     if not s:
         return ""
 
-    acronyms = {"GST", "ITAT", "CESTAT", "NCLT", "NCLAT", "HC", "SC", "CBDT", "CBIC", "VAT", "TDS", "TCS", "FEMA"}
+    acronyms = {"GST", "ITAT", "CESTAT", "NCLT", "NCLAT", "HC", "SC", "CBDT", "CBIC", "VAT", "TDS", "TCS", "FEMA", "CA", "MBA", "SEZ"}
     parts = s.split()
     out = []
     for p in parts:
@@ -581,13 +570,10 @@ def normalize_tag(s: str) -> str:
             out.append(up)
         else:
             out.append(p.capitalize())
-    tag = "".join(out)
-
-    return tag[:40]
+    return "".join(out)[:40]
 
 
 def extract_hashtags_from_text(text: str, max_tags: int = 6) -> list[str]:
-    """Keyword extraction using YAKE (non-AI) with stronger noise filtering (ads/bylines/names)."""
     if not text:
         return []
 
@@ -610,7 +596,7 @@ def extract_hashtags_from_text(text: str, max_tags: int = 6) -> list[str]:
         "subscribe", "follow", "join", "share", "click", "download",
         "telegram", "whatsapp", "youtube", "facebook", "instagram",
         "advertisement", "sponsored", "promo", "offer",
-        "by"
+        "by", "more"
     }
 
     byline_prefix = re.compile(r"(?i)^\s*by\s*[-:–—]?\s+")
@@ -620,10 +606,8 @@ def extract_hashtags_from_text(text: str, max_tags: int = 6) -> list[str]:
         raw_kw = (kw or "").strip()
         if not raw_kw:
             continue
-
         if byline_prefix.match(raw_kw):
             continue
-
         if person_name_like.match(raw_kw):
             continue
 
@@ -636,14 +620,7 @@ def extract_hashtags_from_text(text: str, max_tags: int = 6) -> list[str]:
             continue
 
         low = tag.lower()
-
-        if low in stop:
-            continue
-
-        if len(tag) < 3:
-            continue
-
-        if low in seen:
+        if low in stop or low in seen or len(tag) < 3:
             continue
 
         seen.add(low)
@@ -656,50 +633,31 @@ def extract_hashtags_from_text(text: str, max_tags: int = 6) -> list[str]:
 
 
 def remove_author_lines(text: str) -> str:
-    """
-    Removes author bylines like:
-      'By - Kavi Priya'
-      'By: Kavi Priya'
-      'By Kavi Priya'
-    """
     if not text:
         return text
 
     t = text.replace("\r", "\n")
-
     t = re.sub(r"(?im)^\s*by\s*[-:–—]?\s*[A-Za-z][A-Za-z .'-]{1,80}\s*$", "", t)
-
     t = re.sub(r"(?i)\bby\s*[-:–—]?\s*[A-Za-z][A-Za-z .'-]{1,80}", "", t)
-
     t = re.sub(r"\n{2,}", "\n", t)
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
 
 def build_hashtags_fallback(base: list[str], title: str, max_total: int) -> str:
-    """Simple fallback: base tags + title boosts + always #taxscan at end."""
     base = [h.strip().lstrip("#") for h in (base or []) if str(h).strip()]
 
     t = (title or "").lower()
     boosts = []
-    if "itat" in t:
-        boosts.append("ITAT")
-    if "cestat" in t:
-        boosts.append("CESTAT")
-    if "nclat" in t:
-        boosts.append("NCLAT")
-    if "nclt" in t:
-        boosts.append("NCLT")
-    if "gst" in t:
-        boosts.append("GST")
-    if "income tax" in t:
-        boosts.append("IncomeTax")
-    if "service tax" in t:
-        boosts.append("ServiceTax")
-    if "high court" in t or " hc " in f" {t} ":
-        boosts.append("HighCourt")
-    if "supreme court" in t or " sc " in f" {t} ":
-        boosts.append("SupremeCourt")
+    if "itat" in t: boosts.append("ITAT")
+    if "cestat" in t: boosts.append("CESTAT")
+    if "nclat" in t: boosts.append("NCLAT")
+    if "nclt" in t: boosts.append("NCLT")
+    if "gst" in t: boosts.append("GST")
+    if "income tax" in t: boosts.append("IncomeTax")
+    if "service tax" in t: boosts.append("ServiceTax")
+    if "high court" in t or " hc " in f" {t} ": boosts.append("HighCourt")
+    if "supreme court" in t or " sc " in f" {t} ": boosts.append("SupremeCourt")
 
     tags = []
     seen = set()
@@ -721,29 +679,25 @@ def build_hashtags_fallback(base: list[str], title: str, max_total: int) -> str:
 
 
 def build_deep_hashtags(title: str, url: str, max_tags: int = 6, always_last: str = "taxscan") -> str:
+    cache_key = f"{url_path_only(url)}|{max_tags}|{always_last}"
+    if cache_key in HASHTAG_CACHE:
+        return HASHTAG_CACHE[cache_key]
+
     html, text = fetch_article_html_and_text(url)
 
     tags = extract_taxscan_tags(html)
-
     if not tags or len(" ".join(tags)) < 12:
         tags = extract_hashtags_from_text(text, max_tags=max_tags)
 
     t = (title or "").lower()
     boosts = []
-    if "itat" in t:
-        boosts.append("ITAT")
-    if "cestat" in t:
-        boosts.append("CESTAT")
-    if "nclat" in t:
-        boosts.append("NCLAT")
-    if "nclt" in t:
-        boosts.append("NCLT")
-    if "gst" in t:
-        boosts.append("GST")
-    if "high court" in t:
-        boosts.append("HighCourt")
-    if "supreme court" in t:
-        boosts.append("SupremeCourt")
+    if "itat" in t: boosts.append("ITAT")
+    if "cestat" in t: boosts.append("CESTAT")
+    if "nclat" in t: boosts.append("NCLAT")
+    if "nclt" in t: boosts.append("NCLT")
+    if "gst" in t: boosts.append("GST")
+    if "high court" in t: boosts.append("HighCourt")
+    if "supreme court" in t: boosts.append("SupremeCourt")
 
     merged = []
     seen = set()
@@ -766,10 +720,13 @@ def build_deep_hashtags(title: str, url: str, max_tags: int = 6, always_last: st
         merged = [m for m in merged if m.lower() != al.lower()]
         merged.append(al)
 
+    result = " ".join([f"#{t}" for t in merged if t])
+    HASHTAG_CACHE[cache_key] = result
+
     print("🧠 Clean text sample:", text[:250])
     print("🏷️ Tags picked:", tags[:10])
 
-    return " ".join([f"#{t}" for t in merged if t])
+    return result
 
 
 # ---------------- Jobs ----------------
@@ -784,7 +741,10 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     insert_at_row = int(cfg.get("insert_at_row", 2))
     utm = cfg.get("utm", {})
 
-    retention_days = int(cfg.get("retention_days", 0))
+    retention_hours = int(cfg.get("retention_hours", 0))
+    if retention_hours <= 0:
+        retention_days = int(cfg.get("retention_days", 0))
+        retention_hours = retention_days * 24
 
     cols = cfg.get("columns", {})
     col_serial = int(cols.get("serial", 0))
@@ -816,8 +776,8 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     print(f"\n🧩 Job: {cfg.get('name', 'taxscan_feed_to_sheet')}")
     print(f"   RSS: {rss_url}")
     print(f"   Sheet: {spreadsheet_id} (tab index {worksheet_index})")
-    if retention_days > 0:
-        print(f"   Retention: keep last {retention_days} days")
+    if retention_hours > 0:
+        print(f"   Retention: keep last {retention_hours} rolling hours")
 
     try:
         sheet = get_worksheet(google_cfg, spreadsheet_id, worksheet_index)
@@ -831,11 +791,11 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         print(getattr(e.response, "text", str(e)))
         return
 
-    if retention_days > 0:
+    if retention_hours > 0:
         try:
-            deleted = prune_rows_older_than(sheet, all_rows, col_date=col_date, retention_days=retention_days, header_rows=1)
+            deleted = prune_rows_older_than(sheet, all_rows, col_date=col_date, retention_hours=retention_hours, header_rows=1)
             if deleted:
-                print(f"🧹 Pruned {deleted} rows older than {retention_days} days.")
+                print(f"🧹 Pruned {deleted} rows older than {retention_hours} hours.")
                 all_rows = sheet.get_all_values()
                 print(f"📏 Sheet rows after prune refresh (incl header): {len(all_rows)}")
         except APIError as e:
@@ -843,20 +803,19 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
             print(getattr(e.response, "text", str(e)))
             return
 
-    existing_records = set()
+    existing_paths = set()
     max_serial = 0
     for i, row in enumerate(all_rows):
         if i == 0:
             continue
         if len(row) > col_serial and str(row[col_serial]).strip():
             max_serial = max(max_serial, safe_int(row[col_serial], 0))
-        if len(row) > max(col_link, col_date):
+        if len(row) > col_link:
             sheet_link = str(row[col_link]).strip()
-            sheet_date = str(row[col_date]).strip()
-            existing_records.add((sheet_link, sheet_date))
-            existing_records.add((add_utm(sheet_link, utm), sheet_date))
+            if sheet_link:
+                existing_paths.add(url_path_only(sheet_link))
 
-    print(f"📊 Connected. Existing keys: {len(existing_records)} | Max Serial: {max_serial}")
+    print(f"📊 Connected. Existing paths: {len(existing_paths)} | Max Serial: {max_serial}")
 
     entries = fetch_feed(rss_url)
     if not entries:
@@ -871,15 +830,16 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         date = format_feed_date_to_ist(raw_date)
         if not raw_link:
             continue
+
+        raw_path = url_path_only(raw_link)
+        if raw_path in existing_paths:
+            continue
+
         utm_link = add_utm(raw_link, utm)
         ts = entry_ts(entry)
 
-        if (raw_link, raw_date) in existing_records or (utm_link, raw_date) in existing_records:
-            continue
-
         new_items.append((ts, title, raw_link, utm_link, date, raw_date))
-        existing_records.add((raw_link, raw_date))
-        existing_records.add((utm_link, raw_date))
+        existing_paths.add(raw_path)
 
     if not new_items:
         print("✨ No new entries to add.")
@@ -936,10 +896,6 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
 
 
 def job_sheet_to_x(cfg: dict, config: dict, google_cfg: dict):
-    """
-    Sheet -> X
-    Tweets unposted rows, generates per-article hashtags by fetching article content.
-    """
     spreadsheet_id = cfg["spreadsheet_id"]
     worksheet_index = cfg.get("worksheet_index", 0)
     scan_top_rows = int(cfg.get("scan_top_rows", 200))
@@ -1023,11 +979,7 @@ def job_sheet_to_x(cfg: dict, config: dict, google_cfg: dict):
         post_flag = cell(col_x_post).upper() if cell(col_x_post) else post_to_x_default.upper()
         already_posted_at = cell(col_x_posted_at)
 
-        if post_flag == "NO":
-            continue
-        if already_posted_at:
-            continue
-        if not title or not link:
+        if post_flag == "NO" or already_posted_at or not title or not link:
             continue
 
         x_link = add_utm(url_path_only(link), x_utm)
@@ -1061,10 +1013,6 @@ def job_sheet_to_x(cfg: dict, config: dict, google_cfg: dict):
 
 
 def job_sheet_to_facebook_shopscan(cfg: dict, config: dict, google_cfg: dict):
-    """
-    Sheet -> Facebook (Shopscan Page)
-    Posts unposted rows to Shopscan Facebook page.
-    """
     spreadsheet_id = cfg["spreadsheet_id"]
     worksheet_index = cfg.get("worksheet_index", 0)
     scan_top_rows = int(cfg.get("scan_top_rows", 200))
@@ -1149,11 +1097,7 @@ def job_sheet_to_facebook_shopscan(cfg: dict, config: dict, google_cfg: dict):
         post_flag = cell(col_fb_post).upper() if cell(col_fb_post) else post_to_fb_default.upper()
         already_posted_at = cell(col_fb_posted_at)
 
-        if post_flag == "NO":
-            continue
-        if already_posted_at:
-            continue
-        if not title or not link:
+        if post_flag == "NO" or already_posted_at or not title or not link:
             continue
 
         fb_link = add_utm(url_path_only(link), fb_utm)
@@ -1164,6 +1108,8 @@ def job_sheet_to_facebook_shopscan(cfg: dict, config: dict, google_cfg: dict):
                 hashtags = f"{hashtags} #taxscan".strip()
         except Exception as e:
             hashtags = build_hashtags_fallback(base_hashtags, title, max_hashtags)
+            if "#shopscan" not in hashtags.lower():
+                hashtags = f"{hashtags} #shopscan".strip()
             print(f"⚠️ Facebook hashtag deep-gen failed row {sheet_row_number}: {shorten(str(e), 120)}")
 
         fb_message = build_facebook_message(title, hashtags, fb_link, mode=message_mode)
@@ -1214,6 +1160,7 @@ def run_jobs(config: dict):
                 print(f"⚠️ Unknown job name '{name}'. (Add handler in main.py)")
         except Exception as e:
             print(f"❌ Job failed: {name} | {repr(e)}")
+
 
 def main():
     print("🚀 Starting Taxscan Automation Runner...")

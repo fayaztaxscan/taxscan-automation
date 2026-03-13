@@ -9,6 +9,7 @@
       "insert_at_row": 2,
 
       "retention_days": 2,
+      "feed_lookback_hours": 6,
 
       "columns": {
         "serial": 0,
@@ -69,7 +70,7 @@
 
     {
       "name": "sheet_to_facebook_shopscan",
-      "enabled": false,
+      "enabled": true,
       "spreadsheet_id": "197zi-fymx0YaFYXcnzS0HQmanWccOcOH7oMRPy3OK60",
       "worksheet_index": 0,
 

@@ -734,6 +734,10 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     """
     RSS -> Sheet
     Inserts new rows at top, prunes older rows, fills LinkedIn, X, and optional Facebook prep columns.
+
+    IMPORTANT:
+    - retention_hours / retention_days => how long rows remain in the sheet
+    - feed_lookback_hours => how far back to read from RSS for new inserts
     """
     
     rss_url = cfg["rss_url"]
@@ -742,12 +746,22 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     insert_at_row = int(cfg.get("insert_at_row", 2))
     utm = cfg.get("utm", {})
 
+    # ---------------- Sheet retention window ----------------
     retention_hours = int(cfg.get("retention_hours", 0))
     if retention_hours <= 0:
         retention_days = int(cfg.get("retention_days", 0))
         retention_hours = retention_days * 24
 
-    feed_cutoff_utc = datetime.now(timezone.utc) - timedelta(hours=retention_hours) if retention_hours > 0 else None
+    # ---------------- Feed read window (NEW) ----------------
+    # If not provided, fall back to retention_hours for backward compatibility.
+    feed_lookback_hours = int(cfg.get("feed_lookback_hours", 0))
+    if feed_lookback_hours <= 0:
+        feed_lookback_hours = retention_hours
+
+    feed_cutoff_utc = (
+        datetime.now(timezone.utc) - timedelta(hours=feed_lookback_hours)
+        if feed_lookback_hours > 0 else None
+    )
 
     cols = cfg.get("columns", {})
     col_serial = int(cols.get("serial", 0))
@@ -780,7 +794,9 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
     print(f"   RSS: {rss_url}")
     print(f"   Sheet: {spreadsheet_id} (tab index {worksheet_index})")
     if retention_hours > 0:
-        print(f"   Retention: keep last {retention_hours} rolling hours")
+        print(f"   Sheet retention: keep last {retention_hours} rolling hours")
+    if feed_lookback_hours > 0:
+        print(f"   Feed lookback: read only last {feed_lookback_hours} hours from feed")
 
     try:
         sheet = get_worksheet(google_cfg, spreadsheet_id, worksheet_index)
@@ -796,7 +812,13 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
 
     if retention_hours > 0:
         try:
-            deleted = prune_rows_older_than(sheet, all_rows, col_date=col_date, retention_hours=retention_hours, header_rows=1)
+            deleted = prune_rows_older_than(
+                sheet,
+                all_rows,
+                col_date=col_date,
+                retention_hours=retention_hours,
+                header_rows=1
+            )
             if deleted:
                 print(f"🧹 Pruned {deleted} rows older than {retention_hours} hours.")
                 all_rows = sheet.get_all_values()
@@ -806,7 +828,7 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
             print(getattr(e.response, "text", str(e)))
             return
 
-    # FIXED DEDUPE: use article path only, not (link + date)
+    # Dedupe by article path only
     existing_paths = set()
     max_serial = 0
     for i, row in enumerate(all_rows):
@@ -827,6 +849,9 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         return
 
     new_items = []
+    skipped_old_feed_items = 0
+    skipped_existing_items = 0
+
     for entry in entries:
         title = (entry.get("title") or "").strip()
         raw_link = (entry.get("link") or "").strip()
@@ -836,13 +861,15 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         if not raw_link:
             continue
 
-        # Skip feed entries older than retention window
+        # Only consider entries from the feed that are within feed_lookback_hours
         entry_dt_utc = parse_sheet_date_to_utc(raw_date)
         if feed_cutoff_utc and entry_dt_utc and entry_dt_utc < feed_cutoff_utc:
+            skipped_old_feed_items += 1
             continue
 
         raw_path = url_path_only(raw_link)
         if raw_path in existing_paths:
+            skipped_existing_items += 1
             continue
 
         utm_link = add_utm(raw_link, utm)
@@ -850,6 +877,8 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
 
         new_items.append((ts, title, raw_link, utm_link, date))
         existing_paths.add(raw_path)
+
+    print(f"ℹ️ Feed filter summary: skipped_old={skipped_old_feed_items} | skipped_existing={skipped_existing_items}")
 
     if not new_items:
         print("✨ No new entries to add.")
@@ -903,7 +932,6 @@ def job_taxscan_feed_to_sheet(cfg: dict, google_cfg: dict):
         print(getattr(e.response, "text", str(e)))
     except Exception as e:
         print(f"❌ Insert rows error: {repr(e)}")
-
 
 def job_sheet_to_x(cfg: dict, config: dict, google_cfg: dict):
     spreadsheet_id = cfg["spreadsheet_id"]

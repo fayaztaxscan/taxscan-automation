@@ -70,7 +70,7 @@
 
     {
       "name": "sheet_to_facebook_shopscan",
-      "enabled": true,
+      "enabled": false,
       "spreadsheet_id": "197zi-fymx0YaFYXcnzS0HQmanWccOcOH7oMRPy3OK60",
       "worksheet_index": 0,
 

@@ -192,6 +192,19 @@ def prune_rows_older_than(sheet, all_rows, col_date: int, retention_hours: int, 
 
 
 # ---------------- Google Auth/Sheets ----------------
+def find_row_by_url(sheet, col_link: int, raw_link: str, header_rows: int = 1):
+    """Re-fetch the link column and return the 1-based row number matching raw_link, or None."""
+    target = url_path_only(raw_link)
+    values = sheet.col_values(col_link + 1)  # col_values is 1-indexed
+    for idx, val in enumerate(values):
+        if idx < header_rows:
+            continue
+        if url_path_only(str(val).strip()) == target:
+            return idx + 1  # 1-based row number
+    return None
+
+
+
 def load_credentials(google_cfg: dict):
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -1115,12 +1128,16 @@ def job_sheet_to_x(cfg: dict, config: dict, google_cfg: dict):
             print(f"❌ Tweet failed row {sheet_row_number}: {shorten(title, 70)} | {shorten(err, 160)}")
             continue
 
-        try:
-            sheet.update_cell(sheet_row_number, col_x_posted_at + 1, now_ist)
-            sheet.update_cell(sheet_row_number, col_x_tweet_id + 1, tweet_id)
-            sheet.update_cell(sheet_row_number, col_x_error + 1, "")
-        except Exception as wb_err:
-            print(f"⚠️ Tweet posted but sheet write-back failed row {sheet_row_number}: {wb_err}")
+        fresh_row = find_row_by_url(sheet, col_link, link)
+        if fresh_row is None:
+            print(f"⚠️ Tweet posted but row not found for write-back: {shorten(link, 80)}")
+        else:
+            try:
+                sheet.update_cell(fresh_row, col_x_posted_at + 1, now_ist)
+                sheet.update_cell(fresh_row, col_x_tweet_id + 1, tweet_id)
+                sheet.update_cell(fresh_row, col_x_error + 1, "")
+            except Exception as wb_err:
+                print(f"⚠️ Tweet posted but sheet write-back failed row {fresh_row}: {wb_err}")
 
     print(f"✨ sheet_to_x complete. Posted {posted} tweet(s).")
 
@@ -1231,9 +1248,6 @@ def job_sheet_to_facebook_shopscan(cfg: dict, config: dict, google_cfg: dict):
             print("📘 Facebook post preview:\n" + fb_message + "\n" + "-" * 50)
             print(f"DEBUG FB row={sheet_row_number} title_len={len(title)} hashtags_len={len(hashtags)} url_len={len(fb_link)}")
             fb_post_id = post_to_facebook_page(page_id, page_token, fb_message, fb_link)
-            sheet.update_cell(sheet_row_number, col_fb_posted_at + 1, now_ist)
-            sheet.update_cell(sheet_row_number, col_fb_post_id + 1, fb_post_id)
-            sheet.update_cell(sheet_row_number, col_fb_error + 1, "")
             print(f"✅ Facebook posted row {sheet_row_number}: id={fb_post_id} | {shorten(title, 70)}")
             posted += 1
         except Exception as e:
@@ -1243,6 +1257,18 @@ def job_sheet_to_facebook_shopscan(cfg: dict, config: dict, google_cfg: dict):
             except Exception:
                 pass
             print(f"❌ Facebook post failed row {sheet_row_number}: {shorten(title, 70)} | {shorten(err, 160)}")
+            continue
+
+        fresh_row = find_row_by_url(sheet, col_link, link)
+        if fresh_row is None:
+            print(f"⚠️ Facebook posted but row not found for write-back: {shorten(link, 80)}")
+        else:
+            try:
+                sheet.update_cell(fresh_row, col_fb_posted_at + 1, now_ist)
+                sheet.update_cell(fresh_row, col_fb_post_id + 1, fb_post_id)
+                sheet.update_cell(fresh_row, col_fb_error + 1, "")
+            except Exception as wb_err:
+                print(f"⚠️ Facebook posted but sheet write-back failed row {fresh_row}: {wb_err}")
 
     print(f"✨ sheet_to_facebook_shopscan complete. Posted {posted} post(s).")
 
@@ -1359,12 +1385,16 @@ def job_sheet_to_linkedin(cfg: dict, config: dict, google_cfg: dict):
             print(f"❌ LinkedIn post failed row {sheet_row_number}: {shorten(title, 70)} | {shorten(err, 160)}")
             continue
 
-        try:
-            sheet.update_cell(sheet_row_number, col_li_posted_at + 1, now_ist)
-            sheet.update_cell(sheet_row_number, col_li_post_id + 1, post_id)
-            sheet.update_cell(sheet_row_number, col_li_error + 1, "")
-        except Exception as wb_err:
-            print(f"⚠️ LinkedIn posted but sheet write-back failed row {sheet_row_number}: {wb_err}")
+        fresh_row = find_row_by_url(sheet, col_link, link)
+        if fresh_row is None:
+            print(f"⚠️ LinkedIn posted but row not found for write-back: {shorten(link, 80)}")
+        else:
+            try:
+                sheet.update_cell(fresh_row, col_li_posted_at + 1, now_ist)
+                sheet.update_cell(fresh_row, col_li_post_id + 1, post_id)
+                sheet.update_cell(fresh_row, col_li_error + 1, "")
+            except Exception as wb_err:
+                print(f"⚠️ LinkedIn posted but sheet write-back failed row {fresh_row}: {wb_err}")
 
     print(f"✨ sheet_to_linkedin complete. Posted {posted} post(s).")
 

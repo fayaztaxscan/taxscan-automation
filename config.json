@@ -2,7 +2,7 @@
   "jobs": [
     {
       "name": "taxscan_feed_to_sheet",
-      "enabled": false,
+      "enabled": true,
       "rss_url": "https://www.taxscan.in/feeds.xml",
       "spreadsheet_id": "197zi-fymx0YaFYXcnzS0HQmanWccOcOH7oMRPy3OK60",
       "worksheet_index": 0,
@@ -70,7 +70,7 @@
 
     {
       "name": "sheet_to_x",
-      "enabled": false,
+      "enabled": true,
       "spreadsheet_id": "197zi-fymx0YaFYXcnzS0HQmanWccOcOH7oMRPy3OK60",
       "worksheet_index": 0,
 

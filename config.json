@@ -2,7 +2,7 @@
   "jobs": [
     {
       "name": "taxscan_feed_to_sheet",
-      "enabled": true,
+      "enabled": false,
       "rss_url": "https://www.taxscan.in/feeds.xml",
       "spreadsheet_id": "197zi-fymx0YaFYXcnzS0HQmanWccOcOH7oMRPy3OK60",
       "worksheet_index": 0,
@@ -50,8 +50,27 @@
     },
 
     {
-      "name": "sheet_to_x",
+      "name": "sheet_to_linkedin",
       "enabled": true,
+      "spreadsheet_id": "197zi-fymx0YaFYXcnzS0HQmanWccOcOH7oMRPy3OK60",
+      "worksheet_index": 0,
+
+      "scan_top_rows": 200,
+      "post_limit_per_run": 2,
+
+      "linkedin_utm": {
+        "utm_source": "taxscan",
+        "utm_medium": "linkedin",
+        "utm_campaign": "news"
+      },
+
+      "hashtags": ["TaxNews", "taxscan"],
+      "max_hashtags": 6
+    },
+
+    {
+      "name": "sheet_to_x",
+      "enabled": false,
       "spreadsheet_id": "197zi-fymx0YaFYXcnzS0HQmanWccOcOH7oMRPy3OK60",
       "worksheet_index": 0,
 
@@ -92,6 +111,11 @@
   "google": {
     "service_account_file": "service_account.json",
     "service_account_json_env": "GOOGLE_SERVICE_ACCOUNT_JSON"
+  },
+
+  "linkedin": {
+    "access_token_env": "LINKEDIN_ACCESS_TOKEN",
+    "org_urn_env": "LINKEDIN_ORG_URN"
   },
 
   "x": {

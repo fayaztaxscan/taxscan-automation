@@ -339,6 +339,76 @@ def build_tweet_text(title: str, url: str, hashtags: str) -> str:
     return "\n\n".join([p for p in parts if p])
 
 
+# ---------------- LinkedIn helpers ----------------
+def load_linkedin_credentials(config: dict) -> tuple[str, str]:
+    lcfg = config.get("linkedin", {})
+    token_env = lcfg.get("access_token_env", "LINKEDIN_ACCESS_TOKEN")
+    org_urn_env = lcfg.get("org_urn_env", "LINKEDIN_ORG_URN")
+
+    access_token = os.environ.get(token_env, "").strip()
+    org_urn = os.environ.get(org_urn_env, "").strip()
+
+    missing = [name for name, val in [
+        (token_env, access_token),
+        (org_urn_env, org_urn),
+    ] if not val]
+
+    if missing:
+        raise RuntimeError(f"Missing LinkedIn env vars: {', '.join(missing)}")
+
+    return access_token, org_urn
+
+
+def build_linkedin_commentary(title: str, hashtags: str) -> str:
+    title = (title or "").strip()
+    hashtags = (hashtags or "").strip()
+    return "\n\n".join([p for p in [title, hashtags] if p]).strip()
+
+
+def post_to_linkedin(access_token: str, org_urn: str, commentary: str, article_url: str = "", article_title: str = "") -> str:
+    url = "https://api.linkedin.com/rest/posts"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "LinkedIn-Version": "202603",
+        "X-Restli-Protocol-Version": "2.0.0",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "author": org_urn,
+        "commentary": commentary,
+        "visibility": "PUBLIC",
+        "distribution": {
+            "feedDistribution": "MAIN_FEED",
+            "targetEntities": [],
+            "thirdPartyDistributionChannels": []
+        },
+        "lifecycleState": "PUBLISHED"
+    }
+
+    if article_url:
+        payload["content"] = {
+            "article": {
+                "source": article_url,
+                "title": article_title or "",
+            }
+        }
+
+    r = HTTP.post(url, headers=headers, json=payload, timeout=30)
+
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"LinkedIn API error {r.status_code}: {r.text}")
+
+    post_id = r.headers.get("x-restli-id") or r.headers.get("X-RestLi-Id") or ""
+    if not post_id:
+        try:
+            post_id = r.json().get("id") or ""
+        except Exception:
+            pass
+
+    return post_id
+
+
 # ---------------- Facebook helpers ----------------
 def load_facebook_shopscan_credentials(config: dict) -> tuple[str, str]:
     fcfg = config.get("facebook", {})
@@ -1172,6 +1242,123 @@ def job_sheet_to_facebook_shopscan(cfg: dict, config: dict, google_cfg: dict):
     print(f"✨ sheet_to_facebook_shopscan complete. Posted {posted} post(s).")
 
 
+def job_sheet_to_linkedin(cfg: dict, config: dict, google_cfg: dict):
+    spreadsheet_id = cfg["spreadsheet_id"]
+    worksheet_index = cfg.get("worksheet_index", 0)
+    scan_top_rows = int(cfg.get("scan_top_rows", 200))
+    post_limit = int(cfg.get("post_limit_per_run", 3))
+
+    li_utm = cfg.get("linkedin_utm", {"utm_source": "taxscan", "utm_medium": "linkedin", "utm_campaign": "news"})
+    base_hashtags = cfg.get("hashtags", ["TaxNews", "taxscan"])
+    max_hashtags = int(cfg.get("max_hashtags", 6))
+
+    feed_job = None
+    for j in config.get("jobs", []):
+        if j.get("name") == "taxscan_feed_to_sheet":
+            feed_job = j
+            break
+    if not feed_job:
+        print("❌ sheet_to_linkedin: cannot find taxscan_feed_to_sheet job for column mapping.")
+        return
+
+    cols = feed_job.get("columns", {})
+    col_title = int(cols.get("title", 1))
+    col_link = int(cols.get("link", 2))
+    col_date = int(cols.get("date", 3))
+
+    li_cols = feed_job.get("linkedin_columns", {})
+    if not li_cols:
+        print("❌ sheet_to_linkedin: linkedin_columns not found in taxscan_feed_to_sheet config.")
+        return
+
+    col_li_post = int(li_cols.get("post_to_linkedin", 4))
+    col_li_posted_at = int(li_cols.get("posted_at", 5))
+    col_li_post_id = int(li_cols.get("post_id", 6))
+    col_li_error = int(li_cols.get("error", 7))
+    post_to_li_default = str(feed_job.get("post_to_linkedin_default", "YES")).strip() or "YES"
+
+    print(f"\n🧩 Job: {cfg.get('name', 'sheet_to_linkedin')}")
+    print(f"   Sheet: {spreadsheet_id} (tab index {worksheet_index})")
+    print(f"   Scan top rows: {scan_top_rows} | Post limit: {post_limit}")
+
+    try:
+        access_token, org_urn = load_linkedin_credentials(config)
+    except Exception as e:
+        print(f"❌ LinkedIn auth error: {e}")
+        return
+
+    try:
+        sheet = get_worksheet(google_cfg, spreadsheet_id, worksheet_index)
+    except Exception as e:
+        print(f"❌ sheet_to_linkedin: sheet open error: {e}")
+        return
+
+    last_col_index = max(col_title, col_link, col_date, col_li_post, col_li_posted_at, col_li_post_id, col_li_error) + 1
+    last_col_letter = col_to_a1(last_col_index)
+    end_row = 1 + scan_top_rows
+    rng = f"A1:{last_col_letter}{end_row}"
+
+    try:
+        rows = sheet.get(rng)
+    except Exception as e:
+        print(f"❌ sheet_to_linkedin: read range error: {e}")
+        return
+
+    if not rows or len(rows) < 2:
+        print("⚠️ sheet_to_linkedin: no data rows.")
+        return
+
+    now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d %H:%M:%S IST")
+
+    posted = 0
+    for i in range(1, len(rows)):
+        if posted >= post_limit:
+            break
+
+        row = rows[i]
+        sheet_row_number = i + 1
+
+        def cell(col_idx: int) -> str:
+            return str(row[col_idx]).strip() if len(row) > col_idx and row[col_idx] is not None else ""
+
+        title = cell(col_title)
+        link = cell(col_link)
+        post_flag = cell(col_li_post).upper() if cell(col_li_post) else post_to_li_default.upper()
+        already_posted_at = cell(col_li_posted_at)
+
+        if post_flag == "NO" or already_posted_at or not title or not link:
+            continue
+
+        li_link = add_utm(url_path_only(link), li_utm)
+
+        try:
+            hashtags = build_deep_hashtags(title, link, max_tags=max_hashtags, always_last="taxscan")
+        except Exception as e:
+            hashtags = build_hashtags_fallback(base_hashtags, title, max_hashtags)
+            print(f"⚠️ Hashtag deep-gen failed row {sheet_row_number}: {shorten(str(e), 120)}")
+
+        commentary = build_linkedin_commentary(title, hashtags)
+
+        try:
+            print("💼 LinkedIn post preview:\n" + commentary + "\n" + f"🔗 {li_link}\n" + "-" * 50)
+            print(f"DEBUG LI row={sheet_row_number} title_len={len(title)} hashtags_len={len(hashtags)} url_len={len(li_link)}")
+            post_id = post_to_linkedin(access_token, org_urn, commentary, article_url=li_link, article_title=title)
+            sheet.update_cell(sheet_row_number, col_li_posted_at + 1, now_ist)
+            sheet.update_cell(sheet_row_number, col_li_post_id + 1, post_id)
+            sheet.update_cell(sheet_row_number, col_li_error + 1, "")
+            print(f"✅ LinkedIn posted row {sheet_row_number}: id={post_id} | {shorten(title, 70)}")
+            posted += 1
+        except Exception as e:
+            err = str(e)
+            try:
+                sheet.update_cell(sheet_row_number, col_li_error + 1, shorten(err, 240))
+            except Exception:
+                pass
+            print(f"❌ LinkedIn post failed row {sheet_row_number}: {shorten(title, 70)} | {shorten(err, 160)}")
+
+    print(f"✨ sheet_to_linkedin complete. Posted {posted} post(s).")
+
+
 def run_jobs(config: dict):
     google_cfg = config.get("google", {})
     jobs = config.get("jobs", [])
@@ -1190,6 +1377,8 @@ def run_jobs(config: dict):
         try:
             if name == "taxscan_feed_to_sheet":
                 job_taxscan_feed_to_sheet(job, google_cfg)
+            elif name == "sheet_to_linkedin":
+                job_sheet_to_linkedin(job, config, google_cfg)
             elif name == "sheet_to_x":
                 job_sheet_to_x(job, config, google_cfg)
             elif name == "sheet_to_facebook_shopscan":

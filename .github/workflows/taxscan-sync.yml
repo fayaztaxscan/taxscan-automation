@@ -49,7 +49,8 @@ jobs:
           FB_PAGE_ID_SHOPSCAN: ${{ secrets.FB_PAGE_ID_SHOPSCAN }}
           FB_PAGE_TOKEN_SHOPSCAN: ${{ secrets.FB_PAGE_TOKEN_SHOPSCAN }}
 
-          # (Optional) LinkedIn placeholder secrets (not used until you enable LinkedIn job)
+          # LinkedIn Page secrets
+          LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
           LINKEDIN_ORG_URN: ${{ secrets.LINKEDIN_ORG_URN }}
         run: |
           python main.py

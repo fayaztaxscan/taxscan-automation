@@ -1104,9 +1104,6 @@ def job_sheet_to_x(cfg: dict, config: dict, google_cfg: dict):
             print("✍️ Tweet preview:\n" + tweet_text + "\n" + "-" * 50)
             print(f"DEBUG row={sheet_row_number} title_len={len(title)} hashtags_len={len(hashtags)} url_len={len(x_link)}")
             tweet_id = post_tweet(oauth, tweet_text)
-            sheet.update_cell(sheet_row_number, col_x_posted_at + 1, now_ist)
-            sheet.update_cell(sheet_row_number, col_x_tweet_id + 1, tweet_id)
-            sheet.update_cell(sheet_row_number, col_x_error + 1, "")
             print(f"✅ Tweeted row {sheet_row_number}: id={tweet_id} | {shorten(title, 70)}")
             posted += 1
         except Exception as e:
@@ -1116,6 +1113,14 @@ def job_sheet_to_x(cfg: dict, config: dict, google_cfg: dict):
             except Exception:
                 pass
             print(f"❌ Tweet failed row {sheet_row_number}: {shorten(title, 70)} | {shorten(err, 160)}")
+            continue
+
+        try:
+            sheet.update_cell(sheet_row_number, col_x_posted_at + 1, now_ist)
+            sheet.update_cell(sheet_row_number, col_x_tweet_id + 1, tweet_id)
+            sheet.update_cell(sheet_row_number, col_x_error + 1, "")
+        except Exception as wb_err:
+            print(f"⚠️ Tweet posted but sheet write-back failed row {sheet_row_number}: {wb_err}")
 
     print(f"✨ sheet_to_x complete. Posted {posted} tweet(s).")
 
@@ -1343,9 +1348,6 @@ def job_sheet_to_linkedin(cfg: dict, config: dict, google_cfg: dict):
             print("💼 LinkedIn post preview:\n" + commentary + "\n" + f"🔗 {li_link}\n" + "-" * 50)
             print(f"DEBUG LI row={sheet_row_number} title_len={len(title)} hashtags_len={len(hashtags)} url_len={len(li_link)}")
             post_id = post_to_linkedin(access_token, org_urn, commentary, article_url=li_link, article_title=title)
-            sheet.update_cell(sheet_row_number, col_li_posted_at + 1, now_ist)
-            sheet.update_cell(sheet_row_number, col_li_post_id + 1, post_id)
-            sheet.update_cell(sheet_row_number, col_li_error + 1, "")
             print(f"✅ LinkedIn posted row {sheet_row_number}: id={post_id} | {shorten(title, 70)}")
             posted += 1
         except Exception as e:
@@ -1355,6 +1357,14 @@ def job_sheet_to_linkedin(cfg: dict, config: dict, google_cfg: dict):
             except Exception:
                 pass
             print(f"❌ LinkedIn post failed row {sheet_row_number}: {shorten(title, 70)} | {shorten(err, 160)}")
+            continue
+
+        try:
+            sheet.update_cell(sheet_row_number, col_li_posted_at + 1, now_ist)
+            sheet.update_cell(sheet_row_number, col_li_post_id + 1, post_id)
+            sheet.update_cell(sheet_row_number, col_li_error + 1, "")
+        except Exception as wb_err:
+            print(f"⚠️ LinkedIn posted but sheet write-back failed row {sheet_row_number}: {wb_err}")
 
     print(f"✨ sheet_to_linkedin complete. Posted {posted} post(s).")
 

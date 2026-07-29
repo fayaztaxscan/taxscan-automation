@@ -50,6 +50,22 @@ def shorten(s: str, n: int = 110) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def is_auth_error(err: str) -> bool:
+    """
+    True if an API error is a credential problem rather than a row problem.
+    These affect every row equally, so there is no point continuing the run.
+    """
+    e = err or ""
+    if re.search(r"API error (401|403)\b", e):
+        return True
+    return any(m in e for m in ("EXPIRED_ACCESS_TOKEN", "REVOKED_ACCESS_TOKEN", "INVALID_ACCESS_TOKEN"))
+
+
+# Stop a run after this many row-level failures; guards against hammering an API
+# that is rate-limiting or erroring on every request.
+MAX_ROW_FAILURES = 3
+
+
 def col_to_a1(n: int) -> str:
     s = ""
     while n > 0:
@@ -1085,6 +1101,7 @@ def job_sheet_to_x(cfg: dict, config: dict, google_cfg: dict):
     now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d %H:%M:%S IST")
 
     posted = 0
+    failures = 0
     for i in range(1, len(rows)):
         if posted >= post_limit:
             break
@@ -1119,6 +1136,7 @@ def job_sheet_to_x(cfg: dict, config: dict, google_cfg: dict):
             tweet_id = post_tweet(oauth, tweet_text)
             print(f"✅ Tweeted row {sheet_row_number}: id={tweet_id} | {shorten(title, 70)}")
             posted += 1
+            failures = 0
         except Exception as e:
             err = str(e)
             try:
@@ -1126,6 +1144,13 @@ def job_sheet_to_x(cfg: dict, config: dict, google_cfg: dict):
             except Exception:
                 pass
             print(f"❌ Tweet failed row {sheet_row_number}: {shorten(title, 70)} | {shorten(err, 160)}")
+            if is_auth_error(err):
+                print("🛑 X credentials rejected. Aborting run; remaining rows retry next run.")
+                break
+            failures += 1
+            if failures >= MAX_ROW_FAILURES:
+                print(f"🛑 {failures} consecutive failures. Aborting run; remaining rows retry next run.")
+                break
             continue
 
         fresh_row = find_row_by_url(sheet, col_link, link)
@@ -1212,6 +1237,7 @@ def job_sheet_to_facebook_shopscan(cfg: dict, config: dict, google_cfg: dict):
     now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d %H:%M:%S IST")
 
     posted = 0
+    failures = 0
     for i in range(1, len(rows)):
         if posted >= post_limit:
             break
@@ -1250,6 +1276,7 @@ def job_sheet_to_facebook_shopscan(cfg: dict, config: dict, google_cfg: dict):
             fb_post_id = post_to_facebook_page(page_id, page_token, fb_message, fb_link)
             print(f"✅ Facebook posted row {sheet_row_number}: id={fb_post_id} | {shorten(title, 70)}")
             posted += 1
+            failures = 0
         except Exception as e:
             err = str(e)
             try:
@@ -1257,6 +1284,13 @@ def job_sheet_to_facebook_shopscan(cfg: dict, config: dict, google_cfg: dict):
             except Exception:
                 pass
             print(f"❌ Facebook post failed row {sheet_row_number}: {shorten(title, 70)} | {shorten(err, 160)}")
+            if is_auth_error(err):
+                print("🛑 Facebook credentials rejected. Aborting run; remaining rows retry next run.")
+                break
+            failures += 1
+            if failures >= MAX_ROW_FAILURES:
+                print(f"🛑 {failures} consecutive failures. Aborting run; remaining rows retry next run.")
+                break
             continue
 
         fresh_row = find_row_by_url(sheet, col_link, link)
@@ -1342,6 +1376,7 @@ def job_sheet_to_linkedin(cfg: dict, config: dict, google_cfg: dict):
     now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d %H:%M:%S IST")
 
     posted = 0
+    failures = 0
     for i in range(1, len(rows)):
         if posted >= post_limit:
             break
@@ -1376,6 +1411,7 @@ def job_sheet_to_linkedin(cfg: dict, config: dict, google_cfg: dict):
             post_id = post_to_linkedin(access_token, org_urn, commentary, article_url=li_link, article_title=title)
             print(f"✅ LinkedIn posted row {sheet_row_number}: id={post_id} | {shorten(title, 70)}")
             posted += 1
+            failures = 0
         except Exception as e:
             err = str(e)
             try:
@@ -1383,6 +1419,13 @@ def job_sheet_to_linkedin(cfg: dict, config: dict, google_cfg: dict):
             except Exception:
                 pass
             print(f"❌ LinkedIn post failed row {sheet_row_number}: {shorten(title, 70)} | {shorten(err, 160)}")
+            if is_auth_error(err):
+                print("🛑 LinkedIn credentials rejected. Aborting run; remaining rows retry next run.")
+                break
+            failures += 1
+            if failures >= MAX_ROW_FAILURES:
+                print(f"🛑 {failures} consecutive failures. Aborting run; remaining rows retry next run.")
+                break
             continue
 
         fresh_row = find_row_by_url(sheet, col_link, link)

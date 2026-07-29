@@ -124,8 +124,25 @@ def format_feed_date_to_ist(date_str: str) -> str:
     return dt_ist.strftime("%d %b %Y %I:%M %p IST")
 
 
+IST_TZ = timezone(timedelta(hours=5, minutes=30))
+
+# The IST-suffixed formats this script itself writes into the sheet.
+IST_SHEET_FORMATS = (
+    "%d %b %Y %I:%M %p",   # date column:      28 Jul 2026 06:45 PM IST
+    "%Y-%m-%d %H:%M:%S",   # posted_at column: 2026-07-29 11:57:47 IST
+)
+
+
 def parse_sheet_date_to_utc(date_str: str):
-    """Parse RSS/ISO/custom IST date string from sheet to UTC datetime; returns None if can't parse."""
+    """
+    Parse an RSS / ISO / sheet-IST date string to a UTC datetime; None if unparseable.
+
+    The IST branch MUST stay first. parsedate_to_datetime() happily accepts
+    "28 Jul 2026 06:45 PM IST" but silently drops the PM and reads IST as UTC,
+    so that value came back as 06:45 UTC instead of 13:15 UTC -- 12 hours out
+    from the AM/PM loss, plus another 5:30 from the ignored offset. Putting the
+    RFC branch first made this branch unreachable for every sheet date.
+    """
     if not date_str:
         return None
 
@@ -133,7 +150,16 @@ def parse_sheet_date_to_utc(date_str: str):
     if not s or s.upper() == "N/A":
         return None
 
-    # 1) RFC / email-style dates
+    # 1) The sheet's own IST formats. First, for the reason in the docstring.
+    if s.upper().endswith(" IST"):
+        base = s[:-4].strip()
+        for fmt in IST_SHEET_FORMATS:
+            try:
+                return datetime.strptime(base, fmt).replace(tzinfo=IST_TZ).astimezone(timezone.utc)
+            except ValueError:
+                continue
+
+    # 2) RFC / email-style dates - what the RSS feed supplies
     try:
         dt = parsedate_to_datetime(s)
         if dt.tzinfo is None:
@@ -142,23 +168,12 @@ def parse_sheet_date_to_utc(date_str: str):
     except Exception:
         pass
 
-    # 2) ISO dates
+    # 3) ISO dates
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
-    except Exception:
-        pass
-
-    # 3) Custom IST display format: 12 Mar 2026 12:50 PM IST
-    try:
-        if s.endswith(" IST"):
-            base = s[:-4].strip()
-            dt = datetime.strptime(base, "%d %b %Y %I:%M %p")
-            ist = timezone(timedelta(hours=5, minutes=30))
-            dt = dt.replace(tzinfo=ist)
-            return dt.astimezone(timezone.utc)
     except Exception:
         pass
 

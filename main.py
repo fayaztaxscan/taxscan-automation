@@ -1442,6 +1442,18 @@ def job_sheet_to_linkedin(cfg: dict, config: dict, google_cfg: dict):
     print(f"✨ sheet_to_linkedin complete. Posted {posted} post(s).")
 
 
+def skip_posting_enabled() -> bool:
+    """
+    True during quiet hours. The workflow sets SKIP_POSTING=true between 12-5 AM IST.
+    The RSS -> sheet job still runs; only the social posting jobs are held back.
+    """
+    return os.environ.get("SKIP_POSTING", "").strip().lower() in ("1", "true", "yes")
+
+
+# Jobs that publish externally. Held back during quiet hours; the feed job is not.
+POSTING_JOBS = {"sheet_to_linkedin", "sheet_to_x", "sheet_to_facebook_shopscan"}
+
+
 def run_jobs(config: dict):
     google_cfg = config.get("google", {})
     jobs = config.get("jobs", [])
@@ -1450,12 +1462,20 @@ def run_jobs(config: dict):
         print("⚠️ No jobs found in config.json")
         return
 
+    quiet = skip_posting_enabled()
+    if quiet:
+        print("🌙 Quiet hours: feed sync will run, posting jobs are held back.")
+
     for job in jobs:
         if not job.get("enabled", True):
             print(f"⏭️ Skipping disabled job: {job.get('name', 'unnamed')}")
             continue
 
         name = job.get("name")
+
+        if quiet and name in POSTING_JOBS:
+            print(f"🌙 Quiet hours: skipping posting job '{name}'. Rows stay queued for the next run.")
+            continue
 
         try:
             if name == "taxscan_feed_to_sheet":

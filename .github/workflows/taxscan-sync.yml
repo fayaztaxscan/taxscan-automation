@@ -24,22 +24,36 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ Skip running between 12:00 AM and 5:00 AM IST
-      # IST = Asia/Kolkata (UTC+5:30). This guard avoids cron timezone/30-min offset issues.
-      - name: Skip midnight window (12–5 AM IST)
+      # ✅ Quiet hours: no social posting between 12:00 AM and 5:00 AM IST.
+      # IST = Asia/Kolkata (UTC+5:30). Done in bash rather than cron because IST's
+      # :30 offset makes cron windows awkward.
+      #
+      # The RSS -> sheet sync still runs during quiet hours. It must: feed_lookback_hours
+      # is 6 and the window is 5 hours, so pausing the sync would leave ~1 hour of margin
+      # and any delayed morning run would drop overnight articles permanently.
+      #
+      # NOTE: a bare `exit 0` here would only end THIS step, not the job - the previous
+      # version did that and never actually skipped anything.
+      - name: Check IST quiet window
+        id: quiet
         shell: bash
         run: |
-          HOUR_IST=$(TZ="Asia/Kolkata" date +%H)
+          HOUR_IST=$((10#$(TZ="Asia/Kolkata" date +%H)))
           if [ "$HOUR_IST" -ge 0 ] && [ "$HOUR_IST" -lt 5 ]; then
-            echo "Within 12–5 AM IST. Skipping run."
-            exit 0
+            echo "quiet=true" >> "$GITHUB_OUTPUT"
+            echo "🌙 ${HOUR_IST}:00 IST is inside 12-5 AM quiet hours: feed sync only, no posting."
+          else
+            echo "quiet=false" >> "$GITHUB_OUTPUT"
+            echo "☀️ ${HOUR_IST}:00 IST is outside quiet hours: posting enabled."
           fi
-          echo "Outside skip window. Continuing."
 
       - name: Run automation
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           CONFIG_FILE: config.json
+
+          # "true" during 12-5 AM IST; main.py then runs the feed job only.
+          SKIP_POSTING: ${{ steps.quiet.outputs.quiet }}
 
           # X (Twitter) OAuth 1.0a secrets
           X_API_KEY: ${{ secrets.X_API_KEY }}

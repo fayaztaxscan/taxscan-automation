@@ -1,7 +1,14 @@
+# Credentials - never commit
 service_account.json
+.env
+
+# Python
 __pycache__/
 *.pyc
-.env
 .venv/
+
+# Local scratch
 x_test_tweet.py
-x_test_tweet.py
+
+# Claude Code local state (settings, worktree checkouts)
+.claude/

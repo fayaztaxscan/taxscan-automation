@@ -5,12 +5,27 @@ on:
     - cron: "*/10 * * * *"   # every 10 minutes (UTC)
   workflow_dispatch:
 
+# actions: write is needed by the "Keep schedule alive" step below.
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      # GitHub disables cron schedules after 60 days with no commits to the repo, and
+      # this repo only gets commits when something breaks. Re-enabling the workflow via
+      # the API resets that 60-day clock, so do it on every scheduled run. Idempotent,
+      # one API call, and it runs before the Python step so a failing run still counts.
+      - name: Keep schedule alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable taxscan-sync.yml -R "$GITHUB_REPOSITORY"
 
       - name: Setup Python
         uses: actions/setup-python@v6
